@@ -1,11 +1,11 @@
 "use strict";
 
-const CACHE_NAME = "spd-shipping-checker-v14";
+const CACHE_NAME = "spd-shipping-checker-v15";
 const APP_ASSETS = [
   "./",
   "./index.html",
-  "./style.css?v=20260901-7",
-  "./app.js?v=20260901-7",
+  "./style.css?v=20260907-1",
+  "./app.js?v=20260907-1",
   "./manifest.webmanifest",
   "./icons/favicon-32.png",
   "./icons/apple-touch-icon.png",

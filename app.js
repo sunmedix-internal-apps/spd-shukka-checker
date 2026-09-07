@@ -11,7 +11,7 @@ const PRODUCT_NUMBER_HEADER = "製品番号";
 const state = {
   masterRows: [], masterInfo: null, labelIndex: new Map(), containerIndex: new Map(),
   readLabelKeys: new Set(), processedResults: new Map(), history: [],
-  targetStartDate: "", targetEndDate: "", currentDepartment: null,
+  targetStartDate: "", targetEndDate: "", currentDepartment: null, workerCode: "",
   mode: "container", pendingSpdLabel: null, scannerBuffer: "", scannerTimer: null
 };
 let successSound = null;
@@ -21,9 +21,19 @@ let completionSound = null;
 let historyDbPromise = null;
 let elements = {};
 let barcodePreviewReturnFocus = null;
+let workerDialogReturnFocus = null;
 
 function normalizeHeader(value) { return String(value ?? "").replace(/^\uFEFF/, "").trim(); }
 function normalizeValue(value) { return String(value ?? "").trim(); }
+function normalizeWorkerCode(value) { return normalizeValue(value); }
+function hasWorkerCode() { return Boolean(normalizeWorkerCode(state.workerCode)); }
+function setWorkerCode(value) {
+  if (!state.masterInfo || !state.masterRows.length) return { ok: false, code: "NO_MASTER", title: "マスター未読込", message: "先にラベルマスタ.tsvを読み込んでください。" };
+  const workerCode = normalizeWorkerCode(value);
+  if (!workerCode) return { ok: false, code: "WORKER_CODE_REQUIRED", title: "作業者コード未入力", message: "作業者コードを入力または読み取ってください。" };
+  state.workerCode = workerCode; saveState();
+  return { ok: true, code: "WORKER_SELECTED", workerCode };
+}
 function normalizeLabelKey(value) { return normalizeValue(value).replace(/\s+/g, ""); }
 function getProductNumber(row) { return normalizeValue(row?.[PRODUCT_NUMBER_HEADER]) || "―"; }
 
@@ -166,6 +176,7 @@ function parseContainerBarcode(rawValue) {
 }
 function setContainerDepartment(rawValue) {
   if (!state.masterInfo || !state.masterRows.length) return { ok: false, code: "NO_MASTER", title: "マスター未読込", message: "先にラベルマスタ.tsvを読み込んでください。" };
+  if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   const parsed = parseContainerBarcode(rawValue);
   if (!parsed.ok) return parsed;
   const candidates = uniqueDepartmentCandidates(state.containerIndex.get(containerIndexKey(parsed.facilityCode, parsed.departmentCode)) || []);
@@ -225,6 +236,7 @@ function getTargetCounts() {
 
 function validateSpdLabel(rawValue) {
   if (!state.masterInfo || !state.masterRows.length) return { ok: false, code: "NO_MASTER", title: "マスター未読込", message: "先にラベルマスタ.tsvを読み込んでください。" };
+  if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   if (!state.currentDepartment) return { ok: false, code: "NO_DEPARTMENT", title: "オリコン未指定", message: "先にオリコンラベルを読み取ってください。" };
   const period = validateTargetPeriod();
   if (!period.ok) return { ok: false, code: "TARGET_PERIOD_ERROR", title: "対象期間エラー", message: period.message };
@@ -277,6 +289,7 @@ function extractJanFromBarcode(rawValue) {
   return { ok: false, type: "不明", raw, readAt, code: "PRODUCT_FORMAT", message: "JANまたはGS1-128として解析できません。" };
 }
 function validateProductBarcode(rawValue) {
+  if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   if (!state.pendingSpdLabel || state.mode !== "product") return { ok: false, code: "NO_PENDING", title: "SPDラベル未読取", message: "先にSPDラベルを読み取ってください。" };
   if (!state.masterInfo || !state.currentDepartment || !validateTargetPeriod().ok
     || !isRowInTargetPeriod(state.pendingSpdLabel.row) || !matchesCurrentDepartment(state.pendingSpdLabel.row)) {
@@ -291,7 +304,7 @@ function validateProductBarcode(rawValue) {
 }
 
 function formatLocalDateTime(isoValue) { if (!isoValue) return "―"; const date = new Date(isoValue); return Number.isNaN(date.getTime()) ? "―" : new Intl.DateTimeFormat("ja-JP", { dateStyle: "medium", timeStyle: "medium" }).format(date); }
-function createHistoryRecord({ result, detail = "", pending = null, product = null, skipReason = "", employeeCode = "", completedAt = "" }) {
+function createHistoryRecord({ result, detail = "", pending = null, product = null, skipReason = "", employeeCode = state.workerCode, completedAt = "" }) {
   const source = pending || state.pendingSpdLabel, row = source?.row || {}, now = new Date().toISOString();
   return {
     eventAt: now, completedAt, spdReadAt: source?.spdReadAt || "", productReadAt: product?.readAt || (product ? now : ""),
@@ -357,41 +370,27 @@ function completeItemCheck(rawValue, effects = {}) {
   return { ...validation, completed: true, targetCompleted, beforeCounts, afterCounts, record };
 }
 function canSkip() {
-  return Boolean(state.masterInfo && state.currentDepartment && state.pendingSpdLabel && state.mode === "product"
+  return Boolean(state.masterInfo && hasWorkerCode() && state.currentDepartment && state.pendingSpdLabel && state.mode === "product"
     && validateTargetPeriod().ok && isRowInTargetPeriod(state.pendingSpdLabel.row) && matchesCurrentDepartment(state.pendingSpdLabel.row));
 }
-function startSkipProcess() {
+function executeSkip(effects = {}) {
+  if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   if (!canSkip()) return { ok: false, code: "SKIP_NOT_ALLOWED", title: "SKIPできません", message: "SPDラベル受付後の商品バーコード待ち状態でのみSKIPできます。" };
-  state.mode = "employee"; saveState();
-  const isNoJan = !normalizeValue(state.pendingSpdLabel.row["JANコード"]);
-  return { ok: true, code: "SKIP_EMPLOYEE_PENDING", title: isNoJan ? "JANなし商品のSKIP処理" : "商品のSKIP処理", message: "作業者の名札バーコードを読み取ってください。", pending: state.pendingSpdLabel };
-}
-function cancelSkipProcess() {
-  if (!state.pendingSpdLabel || state.mode !== "employee") return false;
-  state.mode = "product"; saveState(); return true;
-}
-function canConfirmSkip() {
-  return Boolean(state.masterInfo && state.currentDepartment && state.pendingSpdLabel && state.mode === "employee"
-    && validateTargetPeriod().ok && isRowInTargetPeriod(state.pendingSpdLabel.row) && matchesCurrentDepartment(state.pendingSpdLabel.row));
-}
-function executeSkip(employeeCode, effects = {}) {
-  if (!canConfirmSkip()) return { ok: false, code: "SKIP_NOT_ALLOWED", title: "SKIPできません", message: "SKIP操作後の社員コード待ち状態でのみSKIPを確定できます。" };
-  const normalizedEmployeeCode = normalizeValue(employeeCode);
-  if (!normalizedEmployeeCode) return { ok: false, code: "EMPLOYEE_CODE_REQUIRED", title: "社員コード未入力", message: "作業者の名札バーコードを読み取ってください。" };
   const beforeCounts = getTargetCounts(), pending = state.pendingSpdLabel, product = pending.lastProductAttempt || null;
   const skipReason = normalizeValue(pending.row["JANコード"]) ? "作業者SKIP" : "マスターJANなし";
   state.readLabelKeys.add(pending.labelKey); state.processedResults.set(pending.labelKey, "SKIP");
-  const detail = skipReason === "マスターJANなし" ? "マスターJANなし・社員コード確認済み" : "作業者確認済み";
-  const record = createHistoryRecord({ result: "SKIP", detail, pending, product, skipReason, employeeCode: normalizedEmployeeCode, completedAt: new Date().toISOString() });
+  const detail = skipReason === "マスターJANなし" ? "マスターJANなし・作業者指定済み" : "作業者SKIP";
+  const record = createHistoryRecord({ result: "SKIP", detail, pending, product, skipReason, completedAt: new Date().toISOString() });
   state.pendingSpdLabel = null; state.mode = "spd"; saveState(); void saveScanHistory(record);
   const afterCounts = getTargetCounts(), completed = didCompleteTarget(beforeCounts, afterCounts);
   if (completed) (effects.playCompletion || playCompletionSound)();
   else (effects.playProductSuccess || playProductSuccessSound)();
-  return { ok: true, code: "SKIP", title: "SKIP", message: "社員コードを記録してSKIPを完了しました。", record, completed, beforeCounts, afterCounts };
+  return { ok: true, code: "SKIP", title: "SKIP", message: "現在の作業者コードを記録してSKIPを完了しました。", record, completed, beforeCounts, afterCounts };
 }
+function startSkipProcess(effects = {}) { return executeSkip(effects); }
 function processProductScanValue(rawValue, effects = {}) {
   const value = normalizeValue(rawValue);
-  return value === SKIP_COMMAND ? startSkipProcess() : completeItemCheck(value, effects);
+  return value === SKIP_COMMAND ? startSkipProcess(effects) : completeItemCheck(value, effects);
 }
 
 function formatDateForDisplay(value) { return /^\d{4}-\d{2}-\d{2}$/.test(value || "") ? value.replaceAll("-", "/") : "―"; }
@@ -405,7 +404,7 @@ function getMasterFacilityName(rows) {
 }
 function saveState() {
   try {
-    localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ readLabelKeys: [...state.readLabelKeys], processedResults: [...state.processedResults.entries()], targetStartDate: state.targetStartDate, targetEndDate: state.targetEndDate, currentDepartment: state.currentDepartment, masterFingerprint: state.masterInfo?.fingerprint || null }));
+    localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ readLabelKeys: [...state.readLabelKeys], processedResults: [...state.processedResults.entries()], targetStartDate: state.targetStartDate, targetEndDate: state.targetEndDate, currentDepartment: state.currentDepartment, workerCode: state.workerCode, masterFingerprint: state.masterInfo?.fingerprint || null }));
     return true;
   } catch (error) { console.error("作業状態の保存に失敗しました。", error); showImportMessage("ブラウザに作業状態を保存できませんでした。空き容量やSafariの設定を確認してください。", true); return false; }
 }
@@ -425,6 +424,7 @@ function restoreState() {
         state.readLabelKeys = new Set(Array.isArray(saved.readLabelKeys) ? saved.readLabelKeys : []);
         state.processedResults = new Map(Array.isArray(saved.processedResults) ? saved.processedResults : [...state.readLabelKeys].map((key) => [key, "OK"]));
         state.currentDepartment = saved.currentDepartment || null; reconcileCurrentDepartment();
+        state.workerCode = normalizeWorkerCode(saved.workerCode);
       }
     }
   } catch (error) { console.error("保存済み作業状態を読み込めません。", error); localStorage.removeItem(STORAGE_KEYS.state); }
@@ -441,14 +441,14 @@ async function loadMasterFile(file) {
 function applyMasterData(rows, info) {
   const today = todayInputValue();
   saveMaster(rows, info); state.masterRows = rows; state.masterInfo = info; rebuildIndexes();
-  state.readLabelKeys = new Set(); state.processedResults = new Map(); state.currentDepartment = null; state.pendingSpdLabel = null; state.mode = "container";
+  state.readLabelKeys = new Set(); state.processedResults = new Map(); state.currentDepartment = null; state.workerCode = ""; state.pendingSpdLabel = null; state.mode = "container";
   state.targetStartDate = today; state.targetEndDate = today;
   saveState();
 }
 function createFingerprint(file, rows) { return `${file.name}:${file.size}:${file.lastModified}:${rows.length}:${rows[0]?.["ラベルキー"] || ""}:${rows.at(-1)?.["ラベルキー"] || ""}`; }
 async function importMaster(file) {
   if (!file) return; showImportMessage("TSVを読み込み、内容を検証しています…", false);
-  try { const data = await loadMasterFile(file); applyMasterData(data.rows, data.info); showImportMessage(`${data.rows.length}件を取り込みました。以前の作業状態はリセットしました。`, false, true); renderAll(); showResult("idle", "取込完了", "20桁のオリコンラベルを読み取ってください。", []); }
+  try { const data = await loadMasterFile(file); applyMasterData(data.rows, data.info); showImportMessage(`${data.rows.length}件を取り込みました。以前の作業状態はリセットしました。`, false, true); renderAll(); showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true); }
   catch (error) { console.error("TSV取込エラー", error); showImportMessage(`取込を中止しました。現在のマスターは変更していません。\n${error.message}`, true); playAlertSound(); }
   finally { elements.masterFile.value = ""; }
 }
@@ -476,11 +476,9 @@ function getResultDetails(result) {
 }
 async function processScan(rawValue) {
   const value = normalizeValue(rawValue); if (!value) return;
-  if (state.mode === "employee") {
-    const result = executeSkip(value); renderAll();
-    if (result.ok) showResult("skip", "SKIP", result.message, [["製品番号", result.record.productNumber], ["品名", result.record.productName], ["作業者社員コード", result.record.employeeCode], ["SKIP理由", result.record.skipReason], ["ラベルキー", result.record.labelKey]]);
-    else { showResult("ng", result.title, result.message, []); playAlertSound(); }
-  } else if (state.mode === "container") {
+  if (!state.masterInfo || !state.masterRows.length) { showResult("ng", "マスター未読込", "先にラベルマスタ.tsvを読み込んでください。", []); playAlertSound(); return; }
+  if (!hasWorkerCode()) { showResult("ng", "作業者未指定", "作業者コードを指定してください。", []); playAlertSound(); openWorkerCodeDialog(true); return; }
+  if (state.mode === "container") {
     if (/^\d{32}$/.test(value)) { const result = { code: "NO_DEPARTMENT", title: "オリコン未指定", message: "先に20桁のオリコンラベルを読み取ってください。", spdRaw: value }; void saveNgHistory(result); showResult("ng", result.title, result.message, []); playAlertSound(); }
     else { const result = handleContainerDepartmentScan(value); if (result.ok) { renderAll(); showResult("ok", "オリコン指定 OK", "SPDラベルQRを読み取ってください。", [["施設名称", result.department.facilityName], ["部署名称", result.department.departmentName], ["施設コード", result.department.facilityCode], ["部署コード", result.department.departmentCode]]); } else { void saveNgHistory(result); showResult("ng", result.title, result.message, []); } }
   } else if (state.mode === "spd") {
@@ -499,25 +497,24 @@ async function processScan(rawValue) {
     void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound();
   } else {
     const result = processProductScanValue(value); renderAll();
-    if (result.code === "SKIP_EMPLOYEE_PENDING") showResult("skip", result.title, result.message, [["製品番号", getProductNumber(result.pending.row)], ["品名", result.pending.row["品名"]], ["ラベルキー", result.pending.labelKey]]);
+    if (result.code === "SKIP") showResult("skip", result.title, result.message, [["製品番号", result.record.productNumber], ["品名", result.record.productName], ["作業者コード", result.record.employeeCode], ["SKIP理由", result.record.skipReason], ["ラベルキー", result.record.labelKey]]);
     else showResult(result.ok ? "ok" : "ng", result.ok ? "OK" : result.title, result.message, getResultDetails(result));
   }
-  if (elements.manualScanInput) elements.manualScanInput.value = "";
 }
 function handleClearDepartment() { clearContainerDepartment(); renderAll(); showResult("idle", "オリコン指定解除", "20桁のオリコンラベルを読み取ってください。", []); }
 function handleCancelPending() {
-  if (state.mode === "employee" && cancelSkipProcess()) { renderAll(); showResult("pending", "SKIP取消", "商品バーコード待ちへ戻りました。", []); return; }
   if (cancelPendingSpdLabel()) { renderAll(); showResult("idle", "キャンセル", "SPDラベル待ちへ戻りました。", []); }
 }
 function handleSkip() {
   const result = startSkipProcess();
   renderAll();
-  if (result.ok) showResult("skip", result.title, result.message, [["製品番号", getProductNumber(result.pending.row)], ["品名", result.pending.row["品名"]], ["ラベルキー", result.pending.labelKey]]);
+  if (result.ok) showResult("skip", result.title, result.message, [["製品番号", result.record.productNumber], ["品名", result.record.productName], ["作業者コード", result.record.employeeCode], ["SKIP理由", result.record.skipReason], ["ラベルキー", result.record.labelKey]]);
   else { showResult("ng", result.title, result.message, []); playAlertSound(); }
 }
 function handleGlobalKeydown(event) {
   if (elements.skipBarcodePreview && !elements.skipBarcodePreview.hidden) { if (event.key === "Escape") closeSkipBarcodePreview(); event.preventDefault(); return; }
-  const ignored = [elements.manualScanInput, elements.targetStartDate, elements.targetEndDate, elements.masterFile, elements.historySearch, elements.historyStartDate, elements.historyEndDate, elements.historyFacility, elements.historyDepartment, elements.historyResult];
+  if (elements.workerCodeDialog && !elements.workerCodeDialog.hidden) { if (event.key === "Escape") cancelWorkerCodeDialog(); return; }
+  const ignored = [elements.workerCodeInput, elements.targetStartDate, elements.targetEndDate, elements.masterFile, elements.historySearch, elements.historyStartDate, elements.historyEndDate, elements.historyFacility, elements.historyDepartment, elements.historyResult];
   if (ignored.includes(event.target) || event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.key === "Enter") { if (state.scannerBuffer) { event.preventDefault(); const scan = state.scannerBuffer; state.scannerBuffer = ""; clearTimeout(state.scannerTimer); renderScannerStatus(); void processScan(scan); } return; }
   if (event.key.length === 1) { state.scannerBuffer += event.key; clearTimeout(state.scannerTimer); state.scannerTimer = setTimeout(() => { state.scannerBuffer = ""; renderScannerStatus(); }, 1500); renderScannerStatus(); }
@@ -529,20 +526,19 @@ function showResult(kind, title, message, details) {
   elements.resultDetails.replaceChildren(...details.map(([term, description]) => { const wrapper = document.createElement("div"), dt = document.createElement("dt"), dd = document.createElement("dd"); dt.textContent = term; dd.textContent = description; wrapper.append(dt, dd); return wrapper; }));
 }
 function showImportMessage(message, isError, isSuccess = false) { if (elements.importMessage) { elements.importMessage.textContent = message; elements.importMessage.className = `import-message${isError ? " is-error" : isSuccess ? " is-ok" : ""}`; } }
-function renderMode() { const modes = { container: ["mode-status--container", "● オリコンラベル待ち"], spd: ["mode-status--spd", "● SPDラベル待ち"], product: ["mode-status--product", "● 商品バーコード待ち"], employee: ["mode-status--employee", "● 社員コード待ち"] }, current = modes[state.mode] || modes.container; elements.modeStatus.className = `mode-status ${current[0]}`; elements.modeStatus.textContent = current[1]; elements.clearDepartmentButton.disabled = !state.currentDepartment; }
+function renderMode() { const modes = { container: ["mode-status--container", "● オリコンラベル待ち"], spd: ["mode-status--spd", "● SPDラベル待ち"], product: ["mode-status--product", "● 商品バーコード待ち"] }, current = state.masterInfo && !hasWorkerCode() ? ["mode-status--worker", "● 作業者コード待ち"] : modes[state.mode] || modes.container; elements.modeStatus.className = `mode-status ${current[0]}`; elements.modeStatus.textContent = current[1]; elements.clearDepartmentButton.disabled = !state.currentDepartment; }
 function renderDepartment() { const department = state.currentDepartment; elements.currentFacility.textContent = department?.facilityName || "施設未指定"; elements.currentDepartment.textContent = department?.departmentName || "オリコンラベルを読み取ってください"; elements.currentDepartmentCode.textContent = `施設コード：${department?.facilityCode || "―"}　部署コード：${department?.departmentCode || "―"}`; }
 function renderPendingPanel() {
-  const pending = state.pendingSpdLabel, employeePending = state.mode === "employee";
+  const pending = state.pendingSpdLabel;
   elements.pendingProductPanel.hidden = !pending;
   if (!pending) return;
   const noJan = !normalizeValue(pending.row["JANコード"]);
-  elements.pendingProductPanel.classList.toggle("is-employee-code-mode", employeePending);
   elements.pendingProductNumber.textContent = getProductNumber(pending.row); elements.pendingProductName.textContent = pending.row["品名"];
-  elements.pendingInstructionTitle.hidden = !employeePending; elements.pendingInstructionTitle.textContent = noJan ? "JANなし商品のSKIP処理" : "商品のSKIP処理";
-  elements.pendingInstruction.textContent = employeePending ? "作業者の名札バーコードを読み取ってください" : noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください" : "商品JAN / GS1-128を読み取ってください";
-  elements.skipButton.hidden = employeePending; elements.skipButton.disabled = !canSkip();
-  elements.cancelPendingButton.textContent = employeePending ? "SKIP取消" : "キャンセル";
+  elements.pendingInstruction.textContent = noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください" : "商品JAN / GS1-128を読み取ってください";
+  elements.skipButton.disabled = !canSkip();
+  elements.cancelPendingButton.textContent = "キャンセル";
 }
+function renderWorker() { elements.currentWorkerCode.textContent = hasWorkerCode() ? `作業者：${state.workerCode}` : "作業者：未指定"; elements.changeWorkerButton.disabled = !state.masterInfo; }
 function renderCounts() {
   const period = validateTargetPeriod(), counts = getTargetCounts();
   elements.targetCount.textContent = counts.target; elements.readCount.textContent = counts.read; elements.unreadCount.textContent = counts.unread; elements.processingBreakdown.textContent = `OK：${counts.ok}件　SKIP：${counts.skip}件`;
@@ -587,7 +583,7 @@ function renderHistory() {
   updateHistoryFilterOptions(); const records = filterHistory(state.history, getHistoryFiltersFromUi()).sort((a, b) => (b.eventAt || "").localeCompare(a.eventAt || ""));
   elements.historyCount.textContent = `${records.length}件`; elements.historyList.replaceChildren();
   if (!records.length) { elements.historyList.append(createEmptyState("条件に該当する履歴はありません。")); return; }
-  records.slice(0, 500).forEach((record) => { const article = document.createElement("article"), heading = document.createElement("div"), result = document.createElement("strong"), time = document.createElement("time"), title = document.createElement("h3"), place = document.createElement("p"), detail = document.createElement("p"); article.className = `history-item history-item--${record.result.toLowerCase()}`; heading.className = "history-item-heading"; result.textContent = record.result; time.textContent = formatLocalDateTime(record.completedAt || record.eventAt); heading.append(result, time); title.textContent = `${record.productNumber || "―"}　${record.productName || ""}`; place.textContent = `${record.facilityName || "―"} ／ ${record.departmentName || "―"}`; detail.className = "item-key"; detail.textContent = `ラベル：${record.labelKey || "―"}　JAN：${record.scannedJan || record.masterJan || "―"}${record.skipReason ? `　理由：${record.skipReason}` : ""}${record.employeeCode ? `　社員コード：${record.employeeCode}` : ""}`; article.append(heading, title, place, detail); elements.historyList.append(article); });
+  records.slice(0, 500).forEach((record) => { const article = document.createElement("article"), heading = document.createElement("div"), result = document.createElement("strong"), time = document.createElement("time"), title = document.createElement("h3"), place = document.createElement("p"), detail = document.createElement("p"); article.className = `history-item history-item--${record.result.toLowerCase()}`; heading.className = "history-item-heading"; result.textContent = record.result; time.textContent = formatLocalDateTime(record.completedAt || record.eventAt); heading.append(result, time); title.textContent = `${record.productNumber || "―"}　${record.productName || ""}`; place.textContent = `${record.facilityName || "―"} ／ ${record.departmentName || "―"}`; detail.className = "item-key"; detail.textContent = `ラベル：${record.labelKey || "―"}　JAN：${record.scannedJan || record.masterJan || "―"}${record.skipReason ? `　理由：${record.skipReason}` : ""}${record.employeeCode ? `　作業者：${record.employeeCode}` : "　作業者：記録なし"}`; article.append(heading, title, place, detail); elements.historyList.append(article); });
 }
 function renderHistoryIfReady() { if (elements.historyList) renderHistory(); }
 function csvEscape(value) { const text = String(value ?? ""); return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; }
@@ -605,7 +601,7 @@ async function shareHistoryCsv(records = filterHistory(state.history, getHistory
   downloadFile(file, documentRef); return "downloaded";
 }
 
-function renderAll() { elements.targetStartDate.value = state.targetStartDate; elements.targetEndDate.value = state.targetEndDate; renderMode(); renderDepartment(); renderPendingPanel(); renderCounts(); renderUnreadList(); renderMasterInfo(); renderScannerStatus(); renderHistory(); }
+function renderAll() { elements.targetStartDate.value = state.targetStartDate; elements.targetEndDate.value = state.targetEndDate; renderMode(); renderDepartment(); renderPendingPanel(); renderCounts(); renderUnreadList(); renderMasterInfo(); renderWorker(); renderScannerStatus(); renderHistory(); }
 function switchSection(sectionId) { document.querySelectorAll(".screen").forEach((section) => section.classList.toggle("is-active", section.id === sectionId)); document.querySelectorAll(".tab-button").forEach((button) => button.classList.toggle("is-active", button.dataset.section === sectionId)); if (sectionId === "unreadSection") renderUnreadList(); if (sectionId === "historySection") renderHistory(); window.scrollTo({ top: 0, behavior: "smooth" }); }
 function openSkipBarcodePreview() {
   barcodePreviewReturnFocus = document.activeElement;
@@ -617,8 +613,35 @@ function closeSkipBarcodePreview() {
   if (barcodePreviewReturnFocus?.focus) barcodePreviewReturnFocus.focus(); barcodePreviewReturnFocus = null;
 }
 function printSkipBarcode(windowRef = window) { windowRef.print(); }
+function openWorkerCodeDialog(required = !hasWorkerCode()) {
+  if (!state.masterInfo) { showResult("ng", "マスター未読込", "先にラベルマスタ.tsvを読み込んでください。", []); return false; }
+  workerDialogReturnFocus = document.activeElement;
+  elements.workerCodeHeading.textContent = required ? "作業者コード指定" : "作業者変更";
+  elements.workerCodeInput.value = required ? "" : state.workerCode;
+  elements.workerCodeError.textContent = "";
+  elements.cancelWorkerButton.hidden = required;
+  elements.workerCodeDialog.dataset.required = required ? "true" : "false";
+  elements.workerCodeDialog.hidden = false; document.body.classList.add("worker-code-dialog-open");
+  requestAnimationFrame(() => { elements.workerCodeInput.focus(); elements.workerCodeInput.select(); });
+  return true;
+}
+function closeWorkerCodeDialog() {
+  elements.workerCodeDialog.hidden = true; document.body.classList.remove("worker-code-dialog-open");
+  if (workerDialogReturnFocus?.focus) workerDialogReturnFocus.focus(); workerDialogReturnFocus = null;
+}
+function confirmWorkerCode() {
+  const result = setWorkerCode(elements.workerCodeInput.value);
+  if (!result.ok) { elements.workerCodeError.textContent = result.message; elements.workerCodeInput.focus(); return result; }
+  closeWorkerCodeDialog(); renderAll();
+  showResult("ok", "作業者指定 OK", `作業者：${result.workerCode}`, [["次の操作", state.currentDepartment ? "SPDラベルQRを読み取ってください。" : "20桁のオリコンラベルを読み取ってください。"]]);
+  return result;
+}
+function cancelWorkerCodeDialog() {
+  if (elements.workerCodeDialog.dataset.required === "true" || !hasWorkerCode()) { elements.workerCodeError.textContent = "作業を開始するには作業者コードの指定が必要です。"; elements.workerCodeInput.focus(); return false; }
+  closeWorkerCodeDialog(); return true;
+}
 function cacheElements() {
-  ["masterStatusBadge", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstructionTitle", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "manualScanInput", "manualScanButton", "scannerBufferStatus", "refreshUnreadButton", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
+  ["masterStatusBadge", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "scannerBufferStatus", "refreshUnreadButton", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
@@ -628,13 +651,14 @@ function bindEvents() {
     if (state.pendingSpdLabel && (!validateTargetPeriod().ok || !isRowInTargetPeriod(state.pendingSpdLabel.row))) cancelPendingSpdLabel();
     saveState(); renderMode(); renderPendingPanel(); renderCounts(); renderUnreadList();
   };
-  elements.targetStartDate.addEventListener("change", handlePeriodChange); elements.targetEndDate.addEventListener("change", handlePeriodChange); elements.masterFile.addEventListener("change", () => importMaster(elements.masterFile.files[0])); elements.manualScanButton.addEventListener("click", () => void processScan(elements.manualScanInput.value)); elements.manualScanInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void processScan(elements.manualScanInput.value); } }); elements.refreshUnreadButton.addEventListener("click", () => { renderCounts(); renderUnreadList(); });
+  elements.targetStartDate.addEventListener("change", handlePeriodChange); elements.targetEndDate.addEventListener("change", handlePeriodChange); elements.masterFile.addEventListener("change", () => importMaster(elements.masterFile.files[0])); elements.refreshUnreadButton.addEventListener("click", () => { renderCounts(); renderUnreadList(); });
+  elements.changeWorkerButton.addEventListener("click", () => openWorkerCodeDialog(false)); elements.confirmWorkerButton.addEventListener("click", confirmWorkerCode); elements.cancelWorkerButton.addEventListener("click", cancelWorkerCodeDialog); elements.workerCodeInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); confirmWorkerCode(); } });
   [elements.historyStartDate, elements.historyEndDate, elements.historyFacility, elements.historyDepartment, elements.historyResult].forEach((input) => input.addEventListener("change", renderHistory)); elements.historySearch.addEventListener("input", renderHistory);
   elements.shareHistoryButton.addEventListener("click", async () => { try { const method = await shareHistoryCsv(); elements.historyMessage.textContent = method === "shared" ? "共有画面を開きました。メールアプリを選択できます。" : "共有非対応のためCSVをダウンロードしました。"; } catch (error) { if (error.name !== "AbortError") elements.historyMessage.textContent = error.message; } });
   elements.clearHistoryButton.addEventListener("click", async () => { if (!confirm("スマホ内の読取履歴をすべて削除します。元に戻せません。削除しますか？")) return; await clearScanHistory(); elements.historyMessage.textContent = "読取履歴をすべて削除しました。"; });
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
-async function init() { cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll(); await loadScanHistory(); if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []); else if (!state.currentDepartment) showResult("idle", "待機中", "20桁のオリコンラベルを読み取ってください。", []); else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []); document.body.dataset.appReady = "true"; }
+async function init() { cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll(); await loadScanHistory(); if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []); else if (!hasWorkerCode()) { showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true); } else if (!state.currentDepartment) showResult("idle", "待機中", "20桁のオリコンラベルを読み取ってください。", []); else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []); document.body.dataset.appReady = "true"; }
 function registerServiceWorker() {
   if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
     window.addEventListener("load", () => navigator.serviceWorker.register("./service-worker.js").catch((error) => console.error("オフライン機能を登録できません。", error)));
@@ -648,8 +672,9 @@ if (typeof module !== "undefined" && module.exports) module.exports = {
   parseContainerBarcode, setContainerDepartment, clearContainerDepartment, reconcileCurrentDepartment,
   validateSpdLabel, setPendingSpdLabel, acceptPendingSpdLabel, cancelPendingSpdLabel, validateTargetPeriod, getCurrentTargetLabels,
   getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
-  extractJanFromBarcode, validateProductBarcode, completeItemCheck, canSkip, startSkipProcess, cancelSkipProcess, canConfirmSkip, executeSkip, processProductScanValue,
+  extractJanFromBarcode, validateProductBarcode, completeItemCheck, canSkip, startSkipProcess, executeSkip, processProductScanValue,
   createHistoryRecord, saveScanHistory, loadScanHistory, clearScanHistory, filterHistory, buildHistoryCsv,
   shareHistoryCsv, handleContainerDepartmentScan, applyMasterData, isValidDateKey, normalizeLabelKey,
-  parseDateInput, todayInputValue, getProductNumber, getUniqueFacilityNames, getMasterFacilityName, getCode128BValues, getCode128ModuleRuns, printSkipBarcode, SKIP_COMMAND
+  parseDateInput, todayInputValue, getProductNumber, getUniqueFacilityNames, getMasterFacilityName, getCode128BValues, getCode128ModuleRuns, printSkipBarcode,
+  normalizeWorkerCode, hasWorkerCode, setWorkerCode, SKIP_COMMAND
 };

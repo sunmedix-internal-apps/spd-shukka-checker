@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
-  <link rel="stylesheet" href="style.css?v=20260901-7">
+  <link rel="stylesheet" href="style.css?v=20260907-1">
 </head>
 <body>
   <div class="app-shell">
@@ -54,7 +54,6 @@
           <p class="pending-label">照合中の商品</p>
           <p><span>製品番号</span><strong id="pendingProductNumber">―</strong></p>
           <p><span>品名</span><strong id="pendingProductName">―</strong></p>
-          <p id="pendingInstructionTitle" class="pending-skip-title" hidden>JANなし商品のSKIP処理</p>
           <p id="pendingInstruction" class="pending-instruction">商品JAN / GS1-128を読み取ってください</p>
           <button id="skipButton" class="button button--skip" type="button">SKIP</button>
           <div class="pending-cancel-area">
@@ -80,11 +79,13 @@
         <p id="periodError" class="field-error" role="alert"></p>
       </div>
 
-      <details class="manual-panel">
-        <summary>ローカルテスト用の手入力</summary>
-        <label for="manualScanInput">バーコード・QR読取値</label>
-        <div class="manual-row"><input id="manualScanInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false"><button id="manualScanButton" class="button" type="button">読取</button></div>
-      </details>
+      <section class="worker-current-card card" aria-labelledby="currentWorkerLabel">
+        <div>
+          <p id="currentWorkerLabel" class="worker-current-label">現在の作業者</p>
+          <p id="currentWorkerCode" class="worker-current-code">未指定</p>
+        </div>
+        <button id="changeWorkerButton" class="button button--secondary" type="button" disabled>作業者変更</button>
+      </section>
       <p id="scannerBufferStatus" class="scanner-status">Bluetoothリーダー入力待機中</p>
     </section>
 
@@ -129,6 +130,20 @@
     </main>
   </div>
 
+  <section id="workerCodeDialog" class="worker-code-overlay" role="dialog" aria-modal="true" aria-labelledby="workerCodeHeading" hidden>
+    <div class="worker-code-dialog">
+      <h2 id="workerCodeHeading">作業者コード指定</h2>
+      <p class="worker-code-help">作業者の名札バーコードを読み取るか、キーボードで入力してください。</p>
+      <label for="workerCodeInput">作業者コード</label>
+      <input id="workerCodeInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p id="workerCodeError" class="field-error" role="alert"></p>
+      <div class="worker-code-actions">
+        <button id="confirmWorkerButton" class="button" type="button">確定</button>
+        <button id="cancelWorkerButton" class="button button--secondary" type="button">キャンセル</button>
+      </div>
+    </div>
+  </section>
+
   <section id="skipBarcodePreview" class="barcode-preview-overlay" role="dialog" aria-modal="true" aria-labelledby="skipBarcodeHeading" hidden>
     <div class="barcode-preview-card">
       <div id="skipBarcodePrintArea" class="barcode-print-area">
@@ -144,6 +159,6 @@
     </div>
   </section>
 
-  <script src="app.js?v=20260901-7"></script>
+  <script src="app.js?v=20260907-1"></script>
 </body>
 </html>
