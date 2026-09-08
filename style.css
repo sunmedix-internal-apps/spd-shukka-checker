@@ -98,6 +98,16 @@ button { touch-action: manipulation; }
 main { width: min(100%, 900px); margin: 0 auto; padding: 14px 12px calc(28px + env(safe-area-inset-bottom)); }
 .screen { display: none; }
 .screen.is-active { display: block; }
+.shipping-backup-gate { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-color: #efb0aa; background: var(--red-soft); }
+.shipping-backup-gate strong { display: block; color: var(--red); font-size: .86rem; }
+.shipping-backup-gate p { margin: 2px 0 0; color: #6f160f; font-size: .74rem; line-height: 1.4; }
+.shipping-backup-gate .button { flex: 0 0 auto; min-height: 40px; padding: 7px 10px; font-size: .78rem; }
+.shipping-backup-gate.is-ready { border-color: #a8ddbf; background: var(--green-soft); }
+.shipping-backup-gate.is-ready strong, .shipping-backup-gate.is-ready p { color: #073d27; }
+.shipping-backup-gate.is-unsupported { border-color: var(--line); background: #eef2f5; }
+.shipping-backup-gate.is-unsupported strong, .shipping-backup-gate.is-unsupported p { color: var(--muted); }
+.shipping-backup-gate.is-ready, .shipping-backup-gate.is-unsupported { padding-block: 5px; }
+.shipping-backup-gate.is-ready p, .shipping-backup-gate.is-unsupported p { display: none; }
 
 .card, .department-card {
   margin-bottom: 8px;
@@ -115,7 +125,7 @@ main { width: min(100%, 900px); margin: 0 auto; padding: 14px 12px calc(28px + e
 .period-inputs input { width: 100%; }
 .period-separator { padding-bottom: 10px; font-size: .8rem; font-weight: 900; text-align: center; }
 .field-error { min-height: 1em; margin: 4px 0 0; color: var(--red); font-size: .78rem; font-weight: 800; }
-input[type="text"] {
+input[type="text"], input[type="tel"], input[type="password"] {
   min-height: 48px;
   min-width: 0;
   padding: 10px 12px;
@@ -173,6 +183,8 @@ input[type="search"], select {
 .department-card { padding: 11px 13px; text-align: center; }
 .department-heading-row { display: flex; min-height: 38px; align-items: center; justify-content: space-between; gap: 10px; }
 .department-heading-row .card-label { margin-bottom: 0; text-align: left; }
+.department-actions { display: flex; align-items: center; gap: 6px; }
+.department-search-button,
 .department-clear-button { width: auto; min-height: 38px; padding: 6px 11px; border-radius: 8px; font-size: .78rem; }
 .card-label { margin-bottom: 6px; color: var(--muted); font-size: .82rem; font-weight: 800; }
 .facility-name { margin-bottom: 2px; color: var(--navy); font-size: 1rem; font-weight: 800; }
@@ -249,9 +261,12 @@ input[type="search"], select {
 .history-filter-card { display: grid; gap: 8px; padding: 12px; }
 .history-date-row, .history-select-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .history-date-row label { display: grid; gap: 3px; color: var(--muted); font-size: .76rem; font-weight: 800; }
-.history-actions { margin-bottom: 6px; }
+.history-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 6px; }
 .history-actions .button { min-height: 46px; padding: 8px; font-size: .88rem; }
 .history-actions .button { width: 100%; }
+.backup-status { margin: 0 0 8px; padding: 7px 9px; border-radius: 8px; color: var(--muted); background: #eef2f5; font-size: .76rem; font-weight: 800; }
+.backup-status.is-ok { color: #073d27; background: #dff5e8; }
+.backup-status.is-warning { color: #6f160f; background: #ffe3e0; }
 .inline-message { min-height: 1.2em; margin-bottom: 8px; color: var(--muted); font-size: .8rem; font-weight: 700; }
 .history-list { display: grid; gap: 8px; }
 .history-item { padding: 11px 12px; border: 1px solid var(--line); border-left: 5px solid #7c8791; border-radius: 10px; background: #fff; }
@@ -265,6 +280,8 @@ input[type="search"], select {
 .history-item .item-key { color: var(--ink); overflow-wrap: anywhere; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
 .danger-zone { margin-top: 18px; padding: 10px; color: var(--muted); font-size: .82rem; }
 .danger-zone summary { cursor: pointer; font-weight: 800; }
+.history-management-actions { display: grid; gap: 8px; margin-top: 10px; }
+.history-management-actions .button { width: 100%; }
 
 .master-import-card { text-align: center; }
 .import-message { margin: 12px 0 0; font-weight: 800; white-space: pre-line; }
@@ -280,7 +297,13 @@ input[type="search"], select {
 
 body.barcode-preview-open { overflow: hidden; }
 body.worker-code-dialog-open { overflow: hidden; }
+body.department-search-dialog-open { overflow: hidden; }
+body.admin-password-dialog-open { overflow: hidden; }
+body.history-restore-dialog-open { overflow: hidden; }
 .worker-code-overlay,
+.department-search-overlay,
+.admin-password-overlay,
+.history-restore-overlay,
 .barcode-preview-overlay {
   position: fixed;
   inset: 0;
@@ -298,10 +321,45 @@ body.worker-code-dialog-open { overflow: hidden; }
   background: #fff;
   box-shadow: 0 18px 45px rgba(11, 34, 57, .24);
 }
+.department-search-dialog,
+.admin-password-dialog,
+.history-restore-dialog {
+  width: min(100%, 410px);
+  max-height: min(86vh, 650px);
+  overflow: auto;
+  padding: 20px;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 18px 45px rgba(11, 34, 57, .24);
+}
+.department-search-dialog h2,
+.admin-password-dialog h2,
+.history-restore-dialog h2 { margin-bottom: 10px; color: var(--navy); font-size: 1.35rem; }
+.department-search-dialog label,
+.admin-password-dialog label { display: block; margin: 8px 0 5px; font-weight: 800; }
+.department-search-dialog input,
+.admin-password-dialog input { width: 100%; }
+.department-search-list { display: grid; gap: 7px; max-height: 52vh; margin: 10px 0; overflow-y: auto; }
+.department-search-item { width: 100%; padding: 10px 11px; border: 1px solid #b9cee3; border-radius: 9px; color: var(--ink); background: #fff; text-align: left; cursor: pointer; }
+.department-search-item strong { display: block; color: var(--navy); font-size: 1rem; }
+.department-search-item span { display: block; margin-top: 2px; color: var(--muted); font-size: .76rem; }
+.admin-password-help { margin-bottom: 12px; color: var(--muted); font-size: .86rem; line-height: 1.5; }
+.admin-password-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.admin-password-actions .button { width: 100%; }
+.history-restore-help { margin-bottom: 12px; color: var(--muted); font-size: .86rem; line-height: 1.5; }
+.history-restore-dialog .file-button { display: block; width: 100%; text-align: center; }
+.history-restore-summary { margin-top: 12px; padding: 10px; border-radius: 8px; background: #eef2f5; color: var(--ink); font-size: .82rem; font-weight: 700; line-height: 1.6; white-space: pre-line; }
+.history-restore-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.history-restore-actions .button { width: 100%; }
 .worker-code-dialog h2 { margin-bottom: 8px; color: var(--navy); font-size: 1.35rem; }
 .worker-code-help { margin-bottom: 14px; color: var(--muted); font-size: .9rem; line-height: 1.5; }
 .worker-code-dialog label { display: block; margin-bottom: 5px; font-weight: 800; }
 .worker-code-dialog input { width: 100%; min-height: 48px; }
+#workerCodeInput { ime-mode: disabled; }
+.department-search-dialog .department-incomplete-filter { display: flex; align-items: center; gap: 8px; min-height: 44px; margin: 6px 0; }
+.department-search-dialog .department-incomplete-filter input { width: 20px; min-height: 20px; height: 20px; margin: 0; flex: 0 0 20px; }
+.department-search-item .department-progress { font-size: .9rem; font-weight: 700; color: #795000; }
+.department-search-item .department-progress.is-complete { color: #17653c; }
 .worker-code-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
 .worker-code-actions .button { width: 100%; }
 .barcode-preview-card { width: min(100%, 420px); padding: 22px; border-radius: 16px; background: #fff; box-shadow: 0 18px 60px rgba(0, 0, 0, .35); }
@@ -336,6 +394,7 @@ body.worker-code-dialog-open { overflow: hidden; }
   #checkSection .department-card { margin-bottom: 5px; padding: 5px 9px; border-radius: 10px; }
   #checkSection .department-heading-row { min-height: 27px; }
   #checkSection .department-heading-row .card-label { font-size: .68rem; }
+  #checkSection .department-search-button,
   #checkSection .department-clear-button { min-height: 28px; padding: 2px 8px; font-size: .67rem; }
   #checkSection .facility-name { margin-bottom: 0; font-size: .78rem; line-height: 1.1; }
   #checkSection .department-name { margin-bottom: 0; font-size: 2rem; font-weight: 700; line-height: 1.08; }
@@ -409,8 +468,17 @@ body.worker-code-dialog-open { overflow: hidden; }
   .history-filter-card { padding: 9px; }
   .worker-current-card { padding: 10px 11px; }
   .worker-code-overlay { padding: 12px; }
+  .department-search-overlay,
+  .admin-password-overlay { padding: 12px; }
+  .history-restore-overlay { padding: 12px; }
   .worker-code-dialog { padding: 16px; }
+  .department-search-dialog,
+  .admin-password-dialog { padding: 16px; }
+  .history-restore-dialog { padding: 16px; }
   .worker-code-actions { grid-template-columns: 1fr; }
+  .admin-password-actions { grid-template-columns: 1fr; }
+  .history-restore-actions { grid-template-columns: 1fr; }
+  .history-actions { grid-template-columns: 1fr; }
   .barcode-preview-overlay { padding: 10px; }
   .barcode-preview-card { padding: 12px; }
   .barcode-print-area { padding: 16px 10px; }

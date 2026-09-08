@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
-  <link rel="stylesheet" href="style.css?v=20260907-1">
+  <link rel="stylesheet" href="style.css?v=20260908-2">
 </head>
 <body>
   <div class="app-shell">
@@ -31,10 +31,18 @@
     <section id="checkSection" class="screen is-active" aria-labelledby="checkHeading">
       <h2 id="checkHeading" class="visually-hidden">出荷チェック</h2>
 
+      <section id="shippingBackupGate" class="card shipping-backup-gate" aria-live="polite">
+        <div><strong id="shippingBackupGateTitle">履歴バックアップ：確認中</strong><p id="shippingBackupGateMessage">保存先の状態を確認しています。</p></div>
+        <button id="shippingBackupSetupButton" class="button button--secondary" type="button" disabled>バックアップ先を設定</button>
+      </section>
+
       <section class="department-card" aria-labelledby="departmentHeading">
         <div class="department-heading-row">
           <p id="departmentHeading" class="card-label">現在のオリコン</p>
-          <button id="clearDepartmentButton" class="button button--danger-light department-clear-button" type="button" disabled>指定解除</button>
+          <div class="department-actions">
+            <button id="searchDepartmentButton" class="button button--secondary department-search-button" type="button" disabled>検索</button>
+            <button id="clearDepartmentButton" class="button button--danger-light department-clear-button" type="button" disabled>指定解除</button>
+          </div>
         </div>
         <p id="currentFacility" class="facility-name">施設未指定</p>
         <p id="currentDepartment" class="department-name">オリコンラベルを読み取ってください</p>
@@ -107,10 +115,11 @@
         <div class="history-select-row"><select id="historyFacility" aria-label="施設"><option value="">すべての施設</option></select><select id="historyDepartment" aria-label="部署"><option value="">すべての部署</option></select></div>
         <div class="history-select-row"><select id="historyResult" aria-label="判定"><option value="">すべての判定</option><option value="OK">OK</option><option value="SKIP">SKIP</option><option value="NG">NG</option></select><input id="historySearch" type="search" placeholder="製品・ラベル・JAN・社員コード"></div>
       </section>
-      <div class="history-actions"><button id="shareHistoryButton" class="button button--secondary" type="button">CSV出力</button></div>
+      <div class="history-actions"><button id="shareHistoryButton" class="button button--secondary" type="button">CSV出力</button><button id="configureHistoryBackupButton" class="button button--secondary" type="button">履歴バックアップ先設定</button></div>
+      <p id="historyBackupStatus" class="backup-status" aria-live="polite">履歴バックアップ：確認中</p>
       <p id="historyMessage" class="inline-message" aria-live="polite"></p>
       <div id="historyList" class="history-list"></div>
-      <details class="danger-zone"><summary>履歴の管理</summary><p>履歴削除は元に戻せません。</p><button id="clearHistoryButton" class="button button--danger-light" type="button">履歴をすべて削除</button></details>
+      <details class="danger-zone"><summary>履歴の管理</summary><p>履歴の復元・削除には管理者認証が必要です。復元は読取履歴だけを追加し、現在の作業状態を変更しません。削除はブラウザ内履歴だけが対象です。</p><div class="history-management-actions"><button id="restoreHistoryButton" class="button button--secondary" type="button">バックアップから履歴を復元</button><button id="clearHistoryButton" class="button button--danger-light" type="button">履歴を削除</button></div></details>
     </section>
 
     <section id="masterSection" class="screen" aria-labelledby="masterHeading">
@@ -135,11 +144,56 @@
       <h2 id="workerCodeHeading">作業者コード指定</h2>
       <p class="worker-code-help">作業者の名札バーコードを読み取るか、キーボードで入力してください。</p>
       <label for="workerCodeInput">作業者コード</label>
-      <input id="workerCodeInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <input id="workerCodeInput" type="tel" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done" lang="en">
       <p id="workerCodeError" class="field-error" role="alert"></p>
       <div class="worker-code-actions">
         <button id="confirmWorkerButton" class="button" type="button">確定</button>
         <button id="cancelWorkerButton" class="button button--secondary" type="button">キャンセル</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="departmentSearchDialog" class="department-search-overlay" role="dialog" aria-modal="true" aria-labelledby="departmentSearchHeading" hidden>
+    <div class="department-search-dialog">
+      <h2 id="departmentSearchHeading">部署検索</h2>
+      <label for="departmentSearchInput">部署名・施設名で検索</label>
+      <input id="departmentSearchInput" type="search" autocomplete="off" placeholder="例：3階、東、病棟">
+      <label class="department-incomplete-filter"><input id="incompleteDepartmentsOnly" type="checkbox">未完了部署のみ表示</label>
+      <p id="departmentSearchCount" class="subtle-text"></p>
+      <div id="departmentSearchList" class="department-search-list"></div>
+      <button id="closeDepartmentSearchButton" class="button button--secondary" type="button">閉じる</button>
+    </div>
+  </section>
+
+  <section id="adminPasswordDialog" class="admin-password-overlay" role="dialog" aria-modal="true" aria-labelledby="adminPasswordHeading" hidden>
+    <div class="admin-password-dialog">
+      <h2 id="adminPasswordHeading">管理者認証</h2>
+      <p id="adminPasswordHelp" class="admin-password-help"></p>
+      <label for="adminPasswordInput">管理者パスワード</label>
+      <input id="adminPasswordInput" type="password" autocomplete="current-password">
+      <div id="adminPasswordConfirmArea" hidden>
+        <label for="adminPasswordConfirmInput">管理者パスワード（確認）</label>
+        <input id="adminPasswordConfirmInput" type="password" autocomplete="new-password">
+      </div>
+      <p id="adminPasswordError" class="field-error" role="alert"></p>
+      <div class="admin-password-actions">
+        <button id="confirmAdminPasswordButton" class="button" type="button">確認</button>
+        <button id="cancelAdminPasswordButton" class="button button--secondary" type="button">キャンセル</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="historyRestoreDialog" class="history-restore-overlay" role="dialog" aria-modal="true" aria-labelledby="historyRestoreHeading" hidden>
+    <div class="history-restore-dialog">
+      <h2 id="historyRestoreHeading">履歴バックアップ復元</h2>
+      <p class="history-restore-help">SPD出荷チェッカーが作成した「読取履歴_yyyyMMdd.csv」を選択してください。複数ファイルをまとめて選択できます。</p>
+      <button id="chooseHistoryRestoreFilesButton" class="file-button" type="button">バックアップCSVを選択</button>
+      <input id="historyRestoreFiles" class="visually-hidden" type="file" accept=".csv,text/csv" multiple>
+      <div id="historyRestoreSummary" class="history-restore-summary" aria-live="polite">CSVを選択してください。</div>
+      <p id="historyRestoreError" class="field-error" role="alert"></p>
+      <div class="history-restore-actions">
+        <button id="confirmHistoryRestoreButton" class="button" type="button" disabled>復元する</button>
+        <button id="cancelHistoryRestoreButton" class="button button--secondary" type="button">キャンセル</button>
       </div>
     </div>
   </section>
@@ -159,6 +213,6 @@
     </div>
   </section>
 
-  <script src="app.js?v=20260907-1"></script>
+  <script src="app.js?v=20260908-2"></script>
 </body>
 </html>
