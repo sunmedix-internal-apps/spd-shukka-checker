@@ -9,6 +9,30 @@ const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
 const CODE128_PATTERNS = "212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112".split(" ");
+const FACILITY_CENTER_MAP = Object.freeze({
+  "東都文京病院": "0000000001",
+  "東和病院": "0000000001",
+  "荒木記念東京リバーサイド病院": "0000000001",
+  "平成立石病院": "0000000001",
+  "令和あらかわ病院": "0000000001",
+  "石橋総合病院": "0000000001",
+  "とちぎメディカルセンターしもつが": "0000000001",
+  "とちぎメディカルセンターとちのき": "0000000001",
+  "介護老人保健施設とちぎの郷": "0000000001",
+  "総合健診センター": "0000000001",
+  "千葉白井病院": "0000000002",
+  "湘南ﾘﾊﾋﾞﾘﾃｰｼｮﾝ病院": "0000000002",
+  "前橋協立病院": "0000000002",
+  "高崎中央病院": "0000000002",
+  "桐生協立診療所": "0000000002",
+  "太田協立診療所": "0000000002",
+  "北毛病院": "0000000002",
+  "前橋協立診療所": "0000000002",
+  "通町診療所": "0000000002",
+  "北毛診療所": "0000000002",
+  "善衆会病院": "0000000002",
+  "佐野市民病院": "0000000003"
+});
 const REQUIRED_HEADERS = ["施設コード", "施設名称", "部署コード", "部署名称", "品名", "製品番号", "ラベルキー", "払出予定伝票日付"];
 const PRODUCT_NUMBER_HEADER = "製品番号";
 
@@ -183,7 +207,8 @@ function normalizeQr(rawValue) {
   catch (error) { return { ok: false, code: "QR_FORMAT", title: "QR形式エラー", message: error.message }; }
 }
 function getExpectedCenterCode(facilityName) {
-  return new Set(["千葉白井病院", "湘南ﾘﾊﾋﾞﾘﾃｰｼｮﾝ病院"]).has(normalizeValue(facilityName)) ? "0000000002" : "0000000001";
+  const normalizedName = normalizeValue(facilityName);
+  return Object.prototype.hasOwnProperty.call(FACILITY_CENTER_MAP, normalizedName) ? FACILITY_CENTER_MAP[normalizedName] : "";
 }
 
 function containerIndexKey(facilityCode, departmentCode) { return `${facilityCode}\u001f${departmentCode}`; }
@@ -293,7 +318,8 @@ function validateSpdLabel(rawValue) {
   const found = findLabel(qr.labelKey);
   if (found.code === "NOT_FOUND") return { ok: false, code: found.code, title: "マスターに存在しません", message: `ラベルキー：${qr.labelKey}`, labelKey: qr.labelKey, spdRaw: qr.raw };
   if (found.code === "AMBIGUOUS_LABEL") return { ok: false, code: found.code, title: "ラベルを特定できません", message: `ラベルキー「${qr.labelKey}」がマスターに複数あります。`, labelKey: qr.labelKey, spdRaw: qr.raw };
-  const row = found.row, expectedCenterCode = getExpectedCenterCode(row["施設名称"]);
+  const row = found.row, expectedCenterCode = normalizeValue(state.masterInfo.centerCode);
+  if (!expectedCenterCode) return { ok: false, code: "MASTER_CENTER_CODE_MISSING", title: "センターコード未設定", message: "マスターを再度取り込んでください。", row, labelKey: qr.labelKey, spdRaw: qr.raw };
   if (qr.centerCode !== expectedCenterCode) return { ok: false, code: "CENTER_MISMATCH", title: "センターコード不一致", message: `読取：${qr.centerCode} ／ 正：${expectedCenterCode}`, row, labelKey: qr.labelKey, spdRaw: qr.raw };
   if (!matchesCurrentDepartment(row)) return { ok: false, code: "DEPARTMENT_MISMATCH", title: "部署違い", message: "オリコンとSPDラベルの施設・部署が一致しません。", row, labelKey: qr.labelKey, spdRaw: qr.raw };
   if (!isRowInTargetPeriod(row)) return { ok: false, code: "OUTSIDE_PERIOD", title: "対象期間外", message: `払出予定伝票日付：${row["払出予定伝票日付"]}`, row, labelKey: qr.labelKey, spdRaw: qr.raw };
@@ -482,6 +508,12 @@ function getMasterFacilityName(rows) {
   if (facilityNames.length !== 1) throw new Error(`施設名称は1ファイルにつき1種類にしてください。検出数：${facilityNames.length}`);
   return facilityNames[0];
 }
+function getMasterFacilitySettings(rows) {
+  const facilityName = getMasterFacilityName(rows);
+  const centerCode = getExpectedCenterCode(facilityName);
+  if (!centerCode) throw new Error(`未登録の施設名です。\n管理者へ連絡して、施設追加のプログラム修正を依頼してください。\n\n施設名：${facilityName}`);
+  return { facilityName, centerCode };
+}
 function saveState() {
   try {
     localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ readLabelKeys: [...state.readLabelKeys], processedResults: [...state.processedResults.entries()], targetStartDate: state.targetStartDate, targetEndDate: state.targetEndDate, currentDepartment: state.currentDepartment, workerCode: state.workerCode, masterFingerprint: state.masterInfo?.fingerprint || null }));
@@ -493,8 +525,10 @@ function restoreState() {
   state.targetStartDate = todayInputValue(); state.targetEndDate = todayInputValue();
   try {
     const savedMaster = JSON.parse(localStorage.getItem(STORAGE_KEYS.master) || "null");
-    if (savedMaster?.info && Array.isArray(savedMaster.records) && Array.isArray(savedMaster.headers)) { state.masterInfo = savedMaster.info; state.masterRows = savedMaster.records.map((record) => Object.fromEntries(savedMaster.headers.map((header, index) => [header, record[index] ?? ""]))); rebuildIndexes(); }
-    else if (savedMaster?.info && Array.isArray(savedMaster.rows)) { state.masterInfo = savedMaster.info; state.masterRows = savedMaster.rows; rebuildIndexes(); }
+    let restoredRows = null;
+    if (savedMaster?.info && Array.isArray(savedMaster.records) && Array.isArray(savedMaster.headers)) restoredRows = savedMaster.records.map((record) => Object.fromEntries(savedMaster.headers.map((header, index) => [header, record[index] ?? ""])));
+    else if (savedMaster?.info && Array.isArray(savedMaster.rows)) restoredRows = savedMaster.rows;
+    if (restoredRows) { const facilitySettings = getMasterFacilitySettings(restoredRows); state.masterInfo = { ...savedMaster.info, ...facilitySettings }; state.masterRows = restoredRows; rebuildIndexes(); }
   } catch (error) { console.error("保存済みマスターを読み込めません。", error); localStorage.removeItem(STORAGE_KEYS.master); }
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEYS.state) || localStorage.getItem("spd-shipping-state-v1") || "null");
@@ -516,11 +550,13 @@ async function loadMasterFile(file) {
   if (!file) throw new Error("TSVファイルが選択されていません。");
   if (!/\.tsv$/i.test(file.name)) throw new Error(".tsvファイルを選択してください。");
   const parsed = parseTsv(await decodeMasterFile(file)), dates = parsed.rows.map((row) => row["払出予定伝票日付"]).sort();
-  return { rows: parsed.rows, info: { fileName: file.name, facilityName: getMasterFacilityName(parsed.rows), importedAt: new Date().toISOString(), rowCount: parsed.rows.length, maxDate: dates.at(-1), fingerprint: createFingerprint(file, parsed.rows) } };
+  const facilitySettings = getMasterFacilitySettings(parsed.rows);
+  return { rows: parsed.rows, info: { fileName: file.name, ...facilitySettings, importedAt: new Date().toISOString(), rowCount: parsed.rows.length, maxDate: dates.at(-1), fingerprint: createFingerprint(file, parsed.rows) } };
 }
 function applyMasterData(rows, info) {
+  const validatedInfo = { ...info, ...getMasterFacilitySettings(rows) };
   const today = todayInputValue();
-  saveMaster(rows, info); state.masterRows = rows; state.masterInfo = info; rebuildIndexes();
+  saveMaster(rows, validatedInfo); state.masterRows = rows; state.masterInfo = validatedInfo; rebuildIndexes();
   state.readLabelKeys = new Set(); state.processedResults = new Map(); state.currentDepartment = null; state.workerCode = ""; state.pendingSpdLabel = null; state.mode = "container";
   state.targetStartDate = today; state.targetEndDate = today;
   saveState();
@@ -1114,14 +1150,14 @@ if (typeof window !== "undefined") registerServiceWorker();
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", () => { void init(); });
 
 if (typeof module !== "undefined" && module.exports) module.exports = {
-  state, parseTsv, normalizeQr, buildLabelKey, getExpectedCenterCode, rebuildIndexes, findLabel,
+  state, FACILITY_CENTER_MAP, parseTsv, normalizeQr, buildLabelKey, getExpectedCenterCode, rebuildIndexes, findLabel,
   parseContainerBarcode, setContainerDepartment, clearContainerDepartment, reconcileCurrentDepartment, getMasterDepartments, filterMasterDepartments, selectDepartment,
   validateSpdLabel, setPendingSpdLabel, acceptPendingSpdLabel, cancelPendingSpdLabel, validateTargetPeriod, getCurrentTargetLabels,
   getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
   extractJanFromBarcode, validateProductBarcode, completeItemCheck, canSkip, canConfirmSkip, startSkipProcess, executeSkip, cancelSkipProcess, processProductScanValue,
   createHistoryRecord, saveScanHistory, loadScanHistory, clearScanHistory, filterHistory, buildHistoryCsv,
   shareHistoryCsv, handleContainerDepartmentScan, applyMasterData, isValidDateKey, normalizeLabelKey,
-  parseDateInput, todayInputValue, getProductNumber, getUniqueFacilityNames, getMasterFacilityName, getCode128BValues, getCode128ModuleRuns, printSkipBarcode,
+  parseDateInput, todayInputValue, getProductNumber, getUniqueFacilityNames, getMasterFacilityName, getMasterFacilitySettings, getCode128BValues, getCode128ModuleRuns, printSkipBarcode,
   normalizeWorkerCode, bindWorkerCodeInput, getDepartmentProgress, hasWorkerCode, setWorkerCode, confirmWorkerCodeValue, createHistoryId, historyBackupFileName, historyBackupRow, historyBackupHeader, backupTextContainsHistoryId, writeHistoryBackupRecord, isHistoryBackupSupported, isShippingBackupReady, getShippingBackupBlockResult,
   parseCsvRecords, parseHistoryBackupCsv, prepareHistoryRestore, commitHistoryRestore,
   deriveAdminPasswordHash, createAdminPasswordCredential, verifyAdminPassword, SKIP_COMMAND
