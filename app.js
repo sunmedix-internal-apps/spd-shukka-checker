@@ -786,21 +786,24 @@ async function restoreHistoryBackup() {
     setBackupStatus(permission === "granted" ? "ready" : "permission", permission === "granted" ? `設定済み（${state.backupDirectoryHandle.name}）` : "再度アクセス許可が必要です");
   } catch (error) { console.error("履歴バックアップ設定を読み込めません。", error); state.backupDirectoryHandle = null; setBackupStatus("error", "保存先設定を読み込めません"); }
 }
-async function configureHistoryBackup(windowRef = globalThis) {
+async function configureHistoryBackup(windowRef = globalThis, { reuseExisting = false } = {}) {
   if (!isHistoryBackupSupported(windowRef)) { setBackupStatus("unsupported", "この端末ではローカル履歴バックアップ機能は利用できません"); return { ok: false, code: "UNSUPPORTED" }; }
   try {
-    let handle = state.backupDirectoryHandle;
+    // 保存先設定・変更では必ず選び直し、再許可の場合だけ既存ハンドルを使う。
+    let handle = reuseExisting ? state.backupDirectoryHandle : null;
     if (handle) {
       const permission = await handle.requestPermission({ mode: "readwrite" });
       if (permission !== "granted") handle = null;
     }
     if (!handle) handle = await windowRef.showDirectoryPicker({ mode: "readwrite", id: "spd-history-backup" });
-    if (await handle.queryPermission({ mode: "readwrite" }) !== "granted") throw new Error("選択したフォルダへの書込み権限を確認できません。");
+    let permission = await handle.queryPermission({ mode: "readwrite" });
+    if (permission !== "granted") permission = await handle.requestPermission({ mode: "readwrite" });
+    if (permission !== "granted") throw new Error("選択したフォルダへの書込み権限を確認できません。");
     await setHistorySetting(BACKUP_DIRECTORY_KEY, handle); state.backupDirectoryHandle = handle;
     setBackupStatus("ready", `設定済み（${handle.name}）`);
     return { ok: true, handle };
   } catch (error) {
-    if (error?.name === "AbortError") { setBackupStatus(state.backupDirectoryHandle ? "permission" : "unset", state.backupDirectoryHandle ? "アクセス許可が必要です" : "保存先未設定"); return { ok: false, code: "CANCELLED" }; }
+    if (error?.name === "AbortError") return { ok: false, code: "CANCELLED" };
     console.error("履歴バックアップ先を設定できません。", error); setBackupStatus("error", "保存先設定に失敗しました"); return { ok: false, code: "SETUP_FAILED", error };
   }
 }
@@ -1041,7 +1044,7 @@ function selectDepartmentFromSearch(department) {
 }
 
 async function handleConfigureHistoryBackup() {
-  const result = await configureHistoryBackup();
+  const result = await configureHistoryBackup(globalThis, { reuseExisting: state.backupStatus === "permission" });
   renderAll();
   if (result.ok) {
     elements.historyMessage.textContent = "履歴バックアップ先を確認しました。出荷チェックを利用できます。";
