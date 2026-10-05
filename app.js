@@ -616,7 +616,8 @@ async function processScan(rawValue) {
         showResult("pending", noJan ? "JANなし商品" : "商品バーコード待ち", noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください。" : result.message, [["製品番号", getProductNumber(result.row)], ["品名", result.row["品名"]], ["JAN", result.row["JANコード"] || "なし"], ["ラベルキー", result.labelKey]]);
       } else { void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound(); }
     }
-  } else if (/^\d{20}$/.test(value) || /^\d{32}$/.test(value)) {
+  } else if (detectProductBarcodeType(value) === "UNKNOWN" && (/^\d{20}$/.test(value) || /^\d{32}$/.test(value))) {
+    // 商品として認識される32桁GS1は商品照合へ進め、オリコン・SPD系入力だけを順序エラーにする。
     const result = { code: "SCAN_ORDER", title: "読取順序エラー", message: "現在の商品照合を完了するか、SPDラベル読取を取消してください。", pending: state.pendingSpdLabel };
     void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound();
   } else {
