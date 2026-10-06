@@ -1,12 +1,16 @@
 "use strict";
 
-const CACHE_NAME = "spd-shipping-checker-v27";
-const APP_VERSION = "20261006-6";
+// importScriptsの依存ファイルもupdateViaCache:noneで更新確認される。
+importScripts("./alternate-jans.js?v=20261006-7");
+const ALTERNATE_JAN_SIGNATURE = JSON.stringify(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE);
+const CACHE_NAME = "spd-shipping-checker-v28";
+const APP_VERSION = "20261006-7";
 const APP_ASSETS = [
   "./",
   "./index.html",
-  "./style.css?v=20261006-6",
-  "./app.js?v=20261006-6",
+  "./style.css?v=20261006-7",
+  "./app.js?v=20261006-7",
+  "./alternate-jans.js?v=20261006-7",
   "./manifest.webmanifest",
   "./icons/favicon-32.png",
   "./icons/apple-touch-icon.png",
@@ -32,11 +36,19 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "GET_APP_VERSION") event.ports[0]?.postMessage({ version: APP_VERSION });
+  if (event.data?.type === "GET_APP_VERSION") event.ports[0]?.postMessage({ version: APP_VERSION, alternateJanSignature: ALTERNATE_JAN_SIGNATURE });
 });
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || new URL(event.request.url).origin !== self.location.origin) return;
+
+  // 対応表だけの更新では資材URL・キャッシュ名が同じでも、制御中SWと同じ表を確実に返す。
+  // 作業中のページの表は書き換えず、安全な再読込後に新しい表を読み込ませる。
+  if (new URL(event.request.url).pathname === new URL("./alternate-jans.js", self.location.href).pathname) {
+    event.respondWith(Promise.resolve(new Response(`"use strict"; globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE = ${ALTERNATE_JAN_SIGNATURE};`,
+      { headers: { "Content-Type": "text/javascript; charset=utf-8" } })));
+    return;
+  }
 
   if (event.request.mode === "navigate") {
     event.respondWith(

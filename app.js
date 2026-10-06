@@ -8,7 +8,10 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261006-6";
+const APP_VERSION = "20261006-7";
+const ALTERNATE_JANS = globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
+  || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {});
+const ALTERNATE_JAN_SIGNATURE = JSON.stringify(ALTERNATE_JANS);
 const appUpdate = { ready: false, pendingOperations: 0, version: "", deferred: false, reloading: false, timer: null };
 let appInitializationPromise = null;
 const CODE128_PATTERNS = "212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112".split(" ");
@@ -365,6 +368,13 @@ function extractJanFromBarcode(rawValue) {
   if (type === "GS1-128") { const parsed = parseGs1Barcode(raw); return parsed.ok ? { ...parsed, type, readAt } : { ...parsed, type, raw, readAt }; }
   return { ok: false, type: "不明", raw, readAt, code: "PRODUCT_FORMAT", message: "JANまたはGS1-128として解析できません。" };
 }
+function matchesAlternateJan(row, comparisonJan) {
+  const productCode = normalizeValue(row["商品コード"]);
+  if (!productCode || !Object.prototype.hasOwnProperty.call(ALTERNATE_JANS, productCode)) return false;
+  const candidates = ALTERNATE_JANS[productCode]?.alternateJans;
+  return Array.isArray(candidates) && candidates.some((jan) => typeof jan === "string"
+    && /^\d{12,13}$/.test(jan) && normalizeJanForComparison(jan) === comparisonJan);
+}
 function validateProductBarcode(rawValue) {
   if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   if (!state.pendingSpdLabel || state.mode !== "product") return { ok: false, code: "NO_PENDING", title: "SPDラベル未読取", message: "先にSPDラベルを読み取ってください。" };
@@ -376,7 +386,7 @@ function validateProductBarcode(rawValue) {
   if (!product.ok) return { ...product, title: "商品バーコードエラー", pending: state.pendingSpdLabel };
   const masterJan = normalizeJanForComparison(state.pendingSpdLabel.row["JANコード"]);
   if (!masterJan) return { ok: false, code: "MASTER_JAN_INVALID", title: "マスターJAN不正", message: "TSVのJANコードを12桁比較値へ変換できません。", product, pending: state.pendingSpdLabel };
-  if (product.comparisonJan !== masterJan) return { ok: false, code: "PRODUCT_MISMATCH", title: "商品違い", message: "SPDラベルの商品と読み取った商品が一致しません。", product, pending: state.pendingSpdLabel };
+  if (product.comparisonJan !== masterJan && !matchesAlternateJan(state.pendingSpdLabel.row, product.comparisonJan)) return { ok: false, code: "PRODUCT_MISMATCH", title: "商品違い", message: "SPDラベルの商品と読み取った商品が一致しません。", product, pending: state.pendingSpdLabel };
   return { ok: true, code: "PRODUCT_MATCH", title: "OK", message: "SPDラベルと商品が一致しました。", product, pending: state.pendingSpdLabel };
 }
 
@@ -1196,13 +1206,15 @@ function applyAppUpdate(automatic = false) {
   location.reload();
   return true;
 }
-function detectAppUpdate(version) {
+function detectAppUpdate(version, alternateJanSignature = ALTERNATE_JAN_SIGNATURE) {
   if (!version) return;
   // SWの表示だけで完了とせず、実行中のJavaScriptも同じ版になったことを確認する。
-  if (version === APP_VERSION) { clearAppUpdate(); return; }
+  if (version === APP_VERSION && alternateJanSignature === ALTERNATE_JAN_SIGNATURE) { clearAppUpdate(); return; }
   if (appUpdate.reloading) return;
-  if (appUpdate.version === version) return;
-  appUpdate.version = version;
+  // 対応表だけの変更も別の更新として扱う。内容をそのまま比較し、手動版番号やハッシュ衝突に依存しない。
+  const updateKey = `${version}:jans:${alternateJanSignature}`;
+  if (appUpdate.version === updateKey) return;
+  appUpdate.version = updateKey;
   appUpdate.deferred = !isAppUpdateSafe();
   if (!appUpdate.deferred && applyAppUpdate(true)) return;
   renderAppUpdate();
@@ -1211,22 +1223,23 @@ function detectAppUpdate(version) {
 }
 function readServiceWorkerVersion(worker) {
   return new Promise((resolve) => {
-    if (!worker || typeof MessageChannel === "undefined") { resolve(""); return; }
+    if (!worker || typeof MessageChannel === "undefined") { resolve({ version: "" }); return; }
     const channel = new MessageChannel();
     const finish = (version) => { clearTimeout(timeout); channel.port1.close(); channel.port2.close(); resolve(version); };
-    const timeout = setTimeout(() => finish(""), 3000);
-    channel.port1.onmessage = (event) => finish(event.data?.version || "");
-    try { worker.postMessage({ type: "GET_APP_VERSION" }, [channel.port2]); } catch { finish(""); }
+    const timeout = setTimeout(() => finish({ version: "" }), 3000);
+    channel.port1.onmessage = (event) => finish(event.data || { version: "" });
+    try { worker.postMessage({ type: "GET_APP_VERSION" }, [channel.port2]); } catch { finish({ version: "" }); }
   });
 }
 async function checkControlledAppVersion() {
   if (appInitializationPromise) await appInitializationPromise;
   const worker = navigator.serviceWorker.controller;
-  const version = await readServiceWorkerVersion(worker);
+  const reply = await readServiceWorkerVersion(worker);
+  const version = reply.version || "";
   if (worker === navigator.serviceWorker.controller) {
     const label = document.getElementById("serviceWorkerVersion");
     if (label) { label.textContent = version ? `Ver.${version}` : ""; label.hidden = !version; }
-    detectAppUpdate(version);
+    detectAppUpdate(version, reply.alternateJanSignature);
     return version;
   }
   return "";
