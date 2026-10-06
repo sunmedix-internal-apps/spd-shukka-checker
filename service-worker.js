@@ -1,7 +1,7 @@
 "use strict";
 
-const CACHE_NAME = "spd-shipping-checker-v24";
-const APP_VERSION = "20261006-3";
+const CACHE_NAME = "spd-shipping-checker-v25";
+const APP_VERSION = "20261006-4";
 const APP_ASSETS = [
   "./",
   "./index.html",
