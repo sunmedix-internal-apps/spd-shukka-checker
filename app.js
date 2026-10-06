@@ -8,6 +8,9 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
+const APP_VERSION = "20261006-2";
+const appUpdate = { ready: false, pendingOperations: 0, version: "", deferred: false, reloading: false, timer: null };
+let appInitializationPromise = null;
 const CODE128_PATTERNS = "212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112".split(" ");
 const FACILITY_CENTER_MAP = Object.freeze({
   "東都文京病院": "0000000001",
@@ -416,14 +419,24 @@ async function getHistorySetting(key) {
 async function setHistorySetting(key, value) {
   const db = await openHistoryDb();
   if (!db) throw new Error("ブラウザ保存領域を利用できません。");
-  return new Promise((resolve, reject) => { const request = db.transaction(HISTORY_SETTINGS_STORE_NAME, "readwrite").objectStore(HISTORY_SETTINGS_STORE_NAME).put({ key, value }); request.onsuccess = resolve; request.onerror = () => reject(request.error); });
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_SETTINGS_STORE_NAME, "readwrite"), request = transaction.objectStore(HISTORY_SETTINGS_STORE_NAME).put({ key, value });
+    request.onsuccess = () => {};
+    transaction.oncomplete = resolve;
+    transaction.onerror = transaction.onabort = () => reject(transaction.error || request.error || new Error("設定を保存できません。"));
+  });
 }
 async function saveScanHistory(record) {
   if (!record.historyId) record.historyId = createHistoryId();
   state.history.push(record); renderHistoryIfReady();
   try {
     const db = await openHistoryDb();
-    if (db) await new Promise((resolve, reject) => { const request = db.transaction(HISTORY_STORE_NAME, "readwrite").objectStore(HISTORY_STORE_NAME).add(record); request.onsuccess = () => { record.id = request.result; resolve(); }; request.onerror = () => reject(request.error); });
+    if (db) await new Promise((resolve, reject) => {
+      const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite"), request = transaction.objectStore(HISTORY_STORE_NAME).add(record);
+      request.onsuccess = () => { record.id = request.result; };
+      transaction.oncomplete = resolve;
+      transaction.onerror = transaction.onabort = () => reject(transaction.error || request.error || new Error("履歴を保存できません。"));
+    });
   } catch (error) { console.error("読取履歴をIndexedDBへ保存できません。", error); }
   enqueueHistoryBackup(record);
   return record;
@@ -437,7 +450,11 @@ async function loadScanHistory() {
 }
 async function clearScanHistory() {
   const db = await openHistoryDb();
-  if (db) await new Promise((resolve, reject) => { const request = db.transaction(HISTORY_STORE_NAME, "readwrite").objectStore(HISTORY_STORE_NAME).clear(); request.onsuccess = resolve; request.onerror = () => reject(request.error); });
+  if (db) await new Promise((resolve, reject) => {
+    const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite"), request = transaction.objectStore(HISTORY_STORE_NAME).clear();
+    transaction.oncomplete = resolve;
+    transaction.onerror = transaction.onabort = () => reject(transaction.error || request.error || new Error("履歴を削除できません。"));
+  });
   state.history = []; renderHistoryIfReady();
 }
 function saveNgHistory(result, product = null) {
@@ -1145,13 +1162,95 @@ function bindEvents() {
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
 async function init() { cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll(); await Promise.all([loadScanHistory(), restoreHistoryBackup()]); renderAll(); const backupBlock = getShippingBackupBlockResult(); if (backupBlock) showResult("ng", backupBlock.title, backupBlock.message, []); else if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []); else if (!state.currentDepartment) showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); else if (!hasWorkerCode()) { showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true, "worker"); } else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []); document.body.dataset.appReady = "true"; }
+function isAppUpdateSafe() {
+  return appUpdate.ready && appUpdate.pendingOperations === 0 && !state.pendingSpdLabel
+    && !["product", "employee"].includes(state.mode) && !state.scannerBuffer
+    && !["workerCodeDialog", "departmentSearchDialog", "adminPasswordDialog", "historyRestoreDialog", "skipBarcodePreview"]
+      .some((id) => elements[id] && !elements[id].hidden);
+}
+function renderAppUpdate() {
+  const notice = document.getElementById("appUpdateNotice"), button = document.getElementById("applyAppUpdateButton");
+  if (!notice || !button) return;
+  notice.hidden = !appUpdate.version;
+  button.disabled = !isAppUpdateSafe() || appUpdate.reloading;
+}
+function applyAppUpdate(automatic = false) {
+  if (!appUpdate.version || appUpdate.reloading || !isAppUpdateSafe()) return false;
+  {
+    // 更新単位の印を再読込後も保持し、古いHTMLが再配信されても無限リロードしない。
+    try {
+      const key = `spd-update-reloaded:${location.pathname}:${appUpdate.version}`;
+      if (automatic && sessionStorage.getItem(key)) return false;
+      sessionStorage.setItem(key, "1");
+    } catch { if (automatic) return false; }
+  }
+  appUpdate.reloading = true;
+  location.reload();
+  return true;
+}
+function detectAppUpdate(version) {
+  if (!version || version === APP_VERSION || appUpdate.reloading) return;
+  if (appUpdate.version === version) return;
+  appUpdate.version = version;
+  appUpdate.deferred = !isAppUpdateSafe();
+  if (!appUpdate.deferred && applyAppUpdate(true)) return;
+  renderAppUpdate();
+  // 保留した更新は作業完了後も自動実行せず、ボタンの有効状態だけを更新する。
+  if (!appUpdate.timer) appUpdate.timer = window.setInterval(renderAppUpdate, 500);
+}
+function readServiceWorkerVersion(worker) {
+  return new Promise((resolve) => {
+    if (!worker || typeof MessageChannel === "undefined") { resolve(""); return; }
+    const channel = new MessageChannel();
+    const finish = (version) => { clearTimeout(timeout); channel.port1.close(); channel.port2.close(); resolve(version); };
+    const timeout = setTimeout(() => finish(""), 3000);
+    channel.port1.onmessage = (event) => finish(event.data?.version || "");
+    try { worker.postMessage({ type: "GET_APP_VERSION" }, [channel.port2]); } catch { finish(""); }
+  });
+}
+async function checkControlledAppVersion() {
+  if (appInitializationPromise) await appInitializationPromise;
+  const worker = navigator.serviceWorker.controller;
+  const version = await readServiceWorkerVersion(worker);
+  if (worker === navigator.serviceWorker.controller) detectAppUpdate(version);
+}
+function trackUpdateOperation(operation) {
+  return async function (...args) {
+    appUpdate.pendingOperations += 1;
+    try { return await operation.apply(this, args); }
+    finally { appUpdate.pendingOperations -= 1; }
+  };
+}
+// 非同期処理開始から完了までを数え、照合完了直後の未保存時間帯も更新を止める。
+saveScanHistory = trackUpdateOperation(saveScanHistory);
+setHistorySetting = trackUpdateOperation(setHistorySetting);
+clearScanHistory = trackUpdateOperation(clearScanHistory);
+enqueueHistoryBackup = trackUpdateOperation(enqueueHistoryBackup);
+importMaster = trackUpdateOperation(importMaster);
+configureHistoryBackup = trackUpdateOperation(configureHistoryBackup);
+commitHistoryRestore = trackUpdateOperation(commitHistoryRestore);
+analyzeSelectedHistoryBackups = trackUpdateOperation(analyzeSelectedHistoryBackups);
+confirmAdminPassword = trackUpdateOperation(confirmAdminPassword);
+openAdminPasswordDialog = trackUpdateOperation(openAdminPasswordDialog);
+shareHistoryCsv = trackUpdateOperation(shareHistoryCsv);
+
 function registerServiceWorker() {
   if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
-    window.addEventListener("load", () => navigator.serviceWorker.register("./service-worker.js").catch((error) => console.error("オフライン機能を登録できません。", error)));
+    navigator.serviceWorker.addEventListener("controllerchange", () => { void checkControlledAppVersion(); });
+    window.addEventListener("load", async () => {
+      document.getElementById("applyAppUpdateButton")?.addEventListener("click", () => applyAppUpdate());
+      try {
+        const registration = await navigator.serviceWorker.register("./service-worker.js", { updateViaCache: "none" });
+        try { await registration.update(); } catch (error) { console.info("最新版確認ができないため、現在の版を継続します。", error); }
+        await checkControlledAppVersion();
+      } catch (error) { console.error("オフライン機能を登録できません。", error); }
+    });
   }
 }
 if (typeof window !== "undefined") registerServiceWorker();
-if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", () => { void init(); });
+if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", () => {
+  appInitializationPromise = init().then(() => { appUpdate.ready = true; if (appUpdate.version) renderAppUpdate(); });
+});
 
 if (typeof module !== "undefined" && module.exports) module.exports = {
   state, FACILITY_CENTER_MAP, parseTsv, normalizeQr, buildLabelKey, getExpectedCenterCode, rebuildIndexes, findLabel,

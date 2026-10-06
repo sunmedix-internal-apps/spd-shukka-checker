@@ -1,11 +1,12 @@
 "use strict";
 
-const CACHE_NAME = "spd-shipping-checker-v22";
+const CACHE_NAME = "spd-shipping-checker-v23";
+const APP_VERSION = "20261006-2";
 const APP_ASSETS = [
   "./",
   "./index.html",
   "./style.css?v=20260915-1",
-  "./app.js?v=20261006-1",
+  "./app.js?v=20261006-2",
   "./manifest.webmanifest",
   "./icons/favicon-32.png",
   "./icons/apple-touch-icon.png",
@@ -30,12 +31,16 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "GET_APP_VERSION") event.ports[0]?.postMessage({ version: APP_VERSION });
+});
+
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || new URL(event.request.url).origin !== self.location.origin) return;
 
   if (event.request.mode === "navigate") {
     event.respondWith(
-      fetch(event.request)
+      fetch(event.request, { cache: "no-cache" })
         .then((response) => {
           const copy = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put("./index.html", copy));
