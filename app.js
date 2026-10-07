@@ -8,7 +8,7 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261006-8";
+const APP_VERSION = "20261007-1";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -433,12 +433,14 @@ async function checkAlternateJanUpdate() {
   });
   try { await alternateJanUpdate.checking; } finally { alternateJanUpdate.checking = null; }
 }
-function matchesAlternateJan(row, comparisonJan) {
+function getAlternateJans(row) {
   const productCode = normalizeValue(row["商品コード"]);
-  if (!productCode || !Object.prototype.hasOwnProperty.call(ALTERNATE_JANS, productCode)) return false;
+  if (!productCode || !Object.prototype.hasOwnProperty.call(ALTERNATE_JANS, productCode)) return [];
   const candidates = ALTERNATE_JANS[productCode]?.alternateJans;
-  return Array.isArray(candidates) && candidates.some((jan) => typeof jan === "string"
-    && /^\d{12,13}$/.test(jan) && normalizeJanForComparison(jan) === comparisonJan);
+  return Array.isArray(candidates) ? candidates.filter((jan) => typeof jan === "string" && /^\d{12,13}$/.test(jan)) : [];
+}
+function matchesAlternateJan(row, comparisonJan) {
+  return getAlternateJans(row).some((jan) => normalizeJanForComparison(jan) === comparisonJan);
 }
 function validateProductBarcode(rawValue) {
   if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
@@ -449,8 +451,11 @@ function validateProductBarcode(rawValue) {
   }
   const product = extractJanFromBarcode(rawValue);
   if (!product.ok) return { ...product, title: "商品バーコードエラー", pending: state.pendingSpdLabel };
-  const masterJan = normalizeJanForComparison(state.pendingSpdLabel.row["JANコード"]);
-  if (!masterJan) return { ok: false, code: "MASTER_JAN_INVALID", title: "マスターJAN不正", message: "TSVのJANコードを12桁比較値へ変換できません。", product, pending: state.pendingSpdLabel };
+  const row = state.pendingSpdLabel.row, masterJanRaw = normalizeValue(row["JANコード"]);
+  const masterJan = normalizeJanForComparison(masterJanRaw);
+  // 空欄・空白・列なしは未登録として扱い、追加JANがあれば通常の比較へ進む。
+  if (!masterJanRaw && !getAlternateJans(row).length) return { ok: false, code: "MASTER_JAN_MISSING", title: "JAN未登録商品", message: "ラベルマスタにJANが登録されていません。SKIPで確認してください。", product, pending: state.pendingSpdLabel };
+  if (masterJanRaw && !masterJan) return { ok: false, code: "MASTER_JAN_INVALID", title: "マスターJAN不正", message: "TSVのJANコードを12桁比較値へ変換できません。", product, pending: state.pendingSpdLabel };
   if (product.comparisonJan !== masterJan && !matchesAlternateJan(state.pendingSpdLabel.row, product.comparisonJan)) return { ok: false, code: "PRODUCT_MISMATCH", title: "商品違い", message: "SPDラベルの商品と読み取った商品が一致しません。", product, pending: state.pendingSpdLabel };
   return { ok: true, code: "PRODUCT_MATCH", title: "OK", message: "SPDラベルと商品が一致しました。", product, pending: state.pendingSpdLabel };
 }
@@ -704,8 +709,8 @@ async function processScan(rawValue) {
       if (result.ok) {
         acceptPendingSpdLabel(result);
         renderAll();
-        const noJan = !normalizeValue(result.row["JANコード"]);
-        showResult("pending", noJan ? "JANなし商品" : "商品バーコード待ち", noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください。" : result.message, [["製品番号", getProductNumber(result.row)], ["品名", result.row["品名"]], ["JAN", result.row["JANコード"] || "なし"], ["ラベルキー", result.labelKey]]);
+        const noJan = !normalizeValue(result.row["JANコード"]) && !getAlternateJans(result.row).length;
+        showResult("pending", noJan ? "JAN未登録商品" : "商品バーコード待ち", noJan ? "ラベルマスタにJANが登録されていません。SKIPで確認してください。" : result.message, [["製品番号", getProductNumber(result.row)], ["品名", result.row["品名"]], ["JAN", result.row["JANコード"] || "なし"], ["ラベルキー", result.labelKey]]);
       } else { void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound(); }
     }
   } else if (detectProductBarcodeType(value) === "UNKNOWN" && (/^\d{20}$/.test(value) || /^\d{32}$/.test(value))) {
@@ -754,7 +759,7 @@ function renderPendingPanel() {
   const pending = state.pendingSpdLabel;
   elements.pendingProductPanel.hidden = !pending;
   if (!pending) return;
-  const noJan = !normalizeValue(pending.row["JANコード"]);
+  const noJan = !normalizeValue(pending.row["JANコード"]) && !getAlternateJans(pending.row).length;
   elements.pendingProductNumber.textContent = getProductNumber(pending.row); elements.pendingProductName.textContent = pending.row["品名"];
   elements.pendingInstruction.textContent = state.mode === "employee" ? "SKIPを承認する作業リーダーのコードを入力してください" : noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください" : "商品JAN / GS1-128を読み取ってください";
   elements.skipButton.disabled = !canSkip() || !isShippingBackupReady();
