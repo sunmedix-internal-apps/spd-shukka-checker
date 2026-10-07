@@ -1,4 +1,5 @@
 "use strict";
+{
 
 // キーはラベルマスタ.tsvの「商品コード」。基準JANは登録せず、追加JANだけを記載する。
 // 製品番号・商品名・規格は管理用の補足であり、照合判定には使用しない。
@@ -24,3 +25,4 @@ const ALTERNATE_JAN_BY_PRODUCT_CODE = {
 // ブラウザ・Service Worker・自動テストで同じ表を使用する。
 globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE = ALTERNATE_JAN_BY_PRODUCT_CODE;
 if (typeof module !== "undefined" && module.exports) module.exports = ALTERNATE_JAN_BY_PRODUCT_CODE;
+}

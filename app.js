@@ -8,10 +8,11 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261006-7";
-const ALTERNATE_JANS = globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
-  || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {});
-const ALTERNATE_JAN_SIGNATURE = JSON.stringify(ALTERNATE_JANS);
+const APP_VERSION = "20261006-8";
+const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
+let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
+  || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
+const alternateJanUpdate = { table: null, checking: null };
 const appUpdate = { ready: false, pendingOperations: 0, version: "", deferred: false, reloading: false, timer: null };
 let appInitializationPromise = null;
 const CODE128_PATTERNS = "212222 222122 222221 121223 121322 131222 122213 122312 132212 221213 221312 231212 112232 122132 122231 113222 123122 123221 223211 221132 221231 213212 223112 312131 311222 321122 321221 312212 322112 322211 212123 212321 232121 111323 131123 131321 112313 132113 132311 211313 231113 231311 112133 112331 132131 113123 113321 133121 313121 211331 231131 213113 213311 213131 311123 311321 331121 312113 312311 332111 314111 221411 431111 111224 111422 121124 121421 141122 141221 112214 112412 122114 122411 142112 142211 241211 221114 413111 241112 134111 111242 121142 121241 114212 124112 124211 411212 421112 421211 212141 214121 412121 111143 111341 131141 114113 114311 411113 411311 113141 114131 311141 411131 211412 211214 211232 2331112".split(" ");
@@ -367,6 +368,70 @@ function extractJanFromBarcode(rawValue) {
   if (type === "JAN") return { ok: true, type, raw, readAt, jan: raw, comparisonJan: normalizeJanForComparison(raw), gtin: "", expiryDate: "", lotNumber: "" };
   if (type === "GS1-128") { const parsed = parseGs1Barcode(raw); return parsed.ok ? { ...parsed, type, readAt } : { ...parsed, type, raw, readAt }; }
   return { ok: false, type: "不明", raw, readAt, code: "PRODUCT_FORMAT", message: "JANまたはGS1-128として解析できません。" };
+}
+function validateAlternateJanTable(table) {
+  if (!table || typeof table !== "object" || Array.isArray(table)) throw new Error("追加JAN表の形式が不正です。");
+  const entries = Object.keys(table).sort().map((code) => {
+    const item = table[code];
+    if (!code || code.trim() !== code || !item || typeof item !== "object" || !Array.isArray(item.alternateJans)
+      || !item.alternateJans.every((jan) => typeof jan === "string" && /^\d{12,13}$/.test(jan))
+      || ["productNo", "name", "spec"].some((key) => item[key] !== undefined && typeof item[key] !== "string")) {
+      throw new Error(`追加JAN表の商品コード「${code}」の設定が不正です。`);
+    }
+    return [code, { productNo: item.productNo || "", name: item.name || "", spec: item.spec || "",
+      alternateJans: [...new Set(item.alternateJans)].sort() }];
+  });
+  return Object.fromEntries(entries);
+}
+function restoreAlternateJans(fallback) {
+  try {
+    const saved = globalThis.localStorage?.getItem?.(ALTERNATE_JAN_STORAGE_KEY);
+    if (saved) return validateAlternateJanTable(JSON.parse(saved));
+  } catch (error) { console.info("保存済み追加JAN表を取得できないため、同梱の表を使用します。", error); }
+  try {
+    const verified = validateAlternateJanTable(fallback);
+    // 初回HTMLのスクリプト読込後に通信が切れても、その正常な表を次回起動へ残す。
+    try { globalThis.localStorage?.setItem(ALTERNATE_JAN_STORAGE_KEY, JSON.stringify(verified)); }
+    catch (error) { console.info("初回の追加JAN表を端末に保存できません。", error); }
+    return fallback;
+  }
+  catch (error) { console.error("追加JAN表を読み込めません。通常JAN照合を継続します。", error); return {}; }
+}
+function detectAlternateJanUpdate(table) {
+  const verified = validateAlternateJanTable(table);
+  // 正常に取得・検証できた表だけを保存する。作業中の照合表はここでは変更しない。
+  try { globalThis.localStorage?.setItem(ALTERNATE_JAN_STORAGE_KEY, JSON.stringify(verified)); }
+  catch (error) { console.error("追加JAN表を端末に保存できません。", error); }
+  try {
+    if (typeof navigator !== "undefined") navigator.serviceWorker?.controller?.postMessage({ type: "SAVE_ALTERNATE_JANS", table: verified });
+  } catch (error) { console.info("追加JAN表のオフラインキャッシュを更新できません。端末保存の表を使用します。", error); }
+  alternateJanUpdate.table = JSON.stringify(verified) === JSON.stringify(validateAlternateJanTable(ALTERNATE_JANS)) ? null : verified;
+  if (alternateJanUpdate.table && isAppUpdateSafe() && !appUpdate.version && !appUpdate.reloading) applyAppUpdate(true);
+  else {
+    renderAppUpdate();
+    if (alternateJanUpdate.table && !appUpdate.timer) appUpdate.timer = window.setInterval(renderAppUpdate, 500);
+    if (!alternateJanUpdate.table && !appUpdate.version) clearAppUpdate();
+  }
+}
+async function checkAlternateJanUpdate() {
+  if (alternateJanUpdate.checking) return alternateJanUpdate.checking;
+  if (appInitializationPromise) await appInitializationPromise;
+  if (alternateJanUpdate.checking) return alternateJanUpdate.checking;
+  alternateJanUpdate.checking = new Promise((resolve) => {
+    const script = document.createElement("script"), previous = globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE;
+    // 固定URLのブラウザキャッシュも回避。SWはこのファイルだけno-storeのネットワーク優先。
+    script.src = `./alternate-jans.js?check=${Date.now()}`;
+    script.onload = () => {
+      try {
+        if (globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE === previous) throw new Error("追加JAN表の読込結果を取得できません。");
+        detectAlternateJanUpdate(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE);
+      } catch (error) { console.error("追加JAN表の最新版を使用できません。前回の表を継続します。", error); }
+      script.remove(); resolve();
+    };
+    script.onerror = () => { console.info("追加JAN表の最新版を取得できないため、前回の表を継続します。"); script.remove(); resolve(); };
+    document.head.append(script);
+  });
+  try { await alternateJanUpdate.checking; } finally { alternateJanUpdate.checking = null; }
 }
 function matchesAlternateJan(row, comparisonJan) {
   const productCode = normalizeValue(row["商品コード"]);
@@ -1181,19 +1246,32 @@ function isAppUpdateSafe() {
 function renderAppUpdate() {
   const notice = document.getElementById("appUpdateNotice"), button = document.getElementById("applyAppUpdateButton");
   if (!notice || !button) return;
-  notice.hidden = !appUpdate.version;
-  button.disabled = !appUpdate.version || !isAppUpdateSafe() || appUpdate.reloading;
+  const pending = Boolean(appUpdate.version || alternateJanUpdate.table);
+  notice.hidden = !pending;
+  button.disabled = !pending || !isAppUpdateSafe() || appUpdate.reloading;
+  button.textContent = appUpdate.version ? "更新して再起動" : "追加JAN表を反映";
+  const message = notice.querySelector?.("p");
+  if (message) message.textContent = appUpdate.version ? "新しいバージョンがあります。作業完了後に更新してください。" : "新しい追加JAN表があります。作業完了後に反映してください。";
 }
 function clearAppUpdate() {
   appUpdate.version = "";
   appUpdate.deferred = false;
   appUpdate.reloading = false;
-  if (appUpdate.timer !== null) window.clearInterval(appUpdate.timer);
-  appUpdate.timer = null;
+  if (!alternateJanUpdate.table) {
+    if (appUpdate.timer !== null) window.clearInterval(appUpdate.timer);
+    appUpdate.timer = null;
+  }
   renderAppUpdate();
 }
 function applyAppUpdate(automatic = false) {
-  if (!appUpdate.version || appUpdate.reloading || !isAppUpdateSafe()) return false;
+  if ((!appUpdate.version && !alternateJanUpdate.table) || appUpdate.reloading || !isAppUpdateSafe()) return false;
+  if (!appUpdate.version) {
+    // 表だけの変更は安全状態で差し替える。本体PWAの再読込フラグには触れない。
+    ALTERNATE_JANS = alternateJanUpdate.table;
+    alternateJanUpdate.table = null;
+    clearAppUpdate();
+    return true;
+  }
   {
     // 更新単位の印を再読込後も保持し、古いHTMLが再配信されても無限リロードしない。
     try {
@@ -1206,15 +1284,13 @@ function applyAppUpdate(automatic = false) {
   location.reload();
   return true;
 }
-function detectAppUpdate(version, alternateJanSignature = ALTERNATE_JAN_SIGNATURE) {
+function detectAppUpdate(version) {
   if (!version) return;
   // SWの表示だけで完了とせず、実行中のJavaScriptも同じ版になったことを確認する。
-  if (version === APP_VERSION && alternateJanSignature === ALTERNATE_JAN_SIGNATURE) { clearAppUpdate(); return; }
+  if (version === APP_VERSION) { clearAppUpdate(); return; }
   if (appUpdate.reloading) return;
-  // 対応表だけの変更も別の更新として扱う。内容をそのまま比較し、手動版番号やハッシュ衝突に依存しない。
-  const updateKey = `${version}:jans:${alternateJanSignature}`;
-  if (appUpdate.version === updateKey) return;
-  appUpdate.version = updateKey;
+  if (appUpdate.version === version) return;
+  appUpdate.version = version;
   appUpdate.deferred = !isAppUpdateSafe();
   if (!appUpdate.deferred && applyAppUpdate(true)) return;
   renderAppUpdate();
@@ -1239,7 +1315,7 @@ async function checkControlledAppVersion() {
   if (worker === navigator.serviceWorker.controller) {
     const label = document.getElementById("serviceWorkerVersion");
     if (label) { label.textContent = version ? `Ver.${version}` : ""; label.hidden = !version; }
-    detectAppUpdate(version, reply.alternateJanSignature);
+    detectAppUpdate(version);
     return version;
   }
   return "";
@@ -1247,7 +1323,7 @@ async function checkControlledAppVersion() {
 async function handleAppUpdateClick() {
   // すでに反映済みなら通知解除だけ行い、不要な再読込はしない。
   const version = await checkControlledAppVersion();
-  if (version) return applyAppUpdate();
+  if (version || (!appUpdate.version && alternateJanUpdate.table)) return applyAppUpdate();
   return false;
 }
 function trackUpdateOperation(operation) {
@@ -1280,6 +1356,7 @@ function registerServiceWorker() {
         try { await registration.update(); } catch (error) { console.info("最新版確認ができないため、現在の版を継続します。", error); }
         await checkControlledAppVersion();
       } catch (error) { console.error("オフライン機能を登録できません。", error); }
+      await checkAlternateJanUpdate();
     });
   }
 }
