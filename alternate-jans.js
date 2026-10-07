@@ -19,6 +19,14 @@ const ALTERNATE_JAN_BY_PRODUCT_CODE = {
     alternateJans: [
       "4987350365309"
     ]
+  },
+  "381714": {
+    productNo: "test",
+    name: "エラスコット4号",
+    spec: "特注",
+    alternateJans: [
+      "4901301251039"
+    ]
   }
 };
 
