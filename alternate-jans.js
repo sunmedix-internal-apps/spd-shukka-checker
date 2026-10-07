@@ -59,14 +59,6 @@ const ALTERNATE_JAN_BY_PRODUCT_CODE = {
     alternateJans: [
       "0192253015331"
     ]
-  },
-  "367392": {
-    productNo: "WB7024FW",
-    name: "管路洗浄ブラシ",
-    spec: "ＦＵＪＩＦＩＬＭ",
-    alternateJans: [
-      "4547410297409"
-    ]
   }
 };
 
