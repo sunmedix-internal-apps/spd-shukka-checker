@@ -1,16 +1,16 @@
 "use strict";
 
-const CACHE_NAME = "spd-shipping-checker-v33";
-const APP_VERSION = "20261008-3";
+const CACHE_NAME = "spd-shipping-checker-v34";
+const APP_VERSION = "20261008-4";
 // 本体キャッシュの更新・削除と独立して、正常に検証できた表を保持する。
 const ALTERNATE_JAN_CACHE_NAME = "spd-alternate-jans-v1";
 const ALTERNATE_JAN_URL = "./alternate-jans.js";
 const APP_ASSETS = [
   "./",
   "./index.html",
-  "./style.css?v=20261008-3",
-  "./app.js?v=20261008-3",
-  "./pdf-report.js?v=20261008-3",
+  "./style.css?v=20261008-4",
+  "./app.js?v=20261008-4",
+  "./pdf-report.js?v=20261008-4",
   "./vendor/pdf-lib.min.js",
   "./vendor/fontkit.umd.min.js",
   "./vendor/pdf-font-data.js",

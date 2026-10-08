@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
-  <link rel="stylesheet" href="style.css?v=20261008-3">
+  <link rel="stylesheet" href="style.css?v=20261008-4">
 </head>
 <body>
   <div class="app-shell">
@@ -110,10 +110,10 @@
         <div class="count-card count-card--unread"><span>未読取</span><strong id="unreadRemainingCount">0</strong></div>
       </div>
       <div class="card">
-        <button id="printUnreadButton" class="button button--secondary" type="button">未読取一覧印刷</button>
+        <button id="printUnreadButton" class="button button--secondary" type="button" disabled>印刷プレビュー</button>
         <button id="saveUnreadPdfButton" class="button button--secondary" type="button" disabled>PDFを保存</button>
-        <button id="shareUnreadPdfButton" class="button button--secondary" type="button" hidden>作成したPDFを共有・保存</button>
-        <p class="help-text">現在の対象期間・部署の未読取ラベルをA4横PDFにします。指定解除時は全体です。PDFは作成時点の内容です。</p>
+        <button id="shareUnreadPdfButton" class="button button--secondary" type="button" hidden disabled>作成したPDFを共有・保存</button>
+        <p class="help-text">各ボタンを押した時点の対象期間・部署・未読取状況からA4横PDFを作成します。保存・共有だけでも出力できます。指定解除時は全体です。</p>
         <p id="unreadPrintMessage" class="inline-message" aria-live="polite"></p>
       </div>
       <div id="unreadList" class="unread-list"></div>
@@ -228,7 +228,7 @@
   <script src="vendor/pdf-lib.min.js"></script>
   <script src="vendor/fontkit.umd.min.js"></script>
   <script src="vendor/pdf-font-data.js"></script>
-  <script src="pdf-report.js?v=20261008-3"></script>
-  <script src="app.js?v=20261008-3"></script>
+  <script src="pdf-report.js?v=20261008-4"></script>
+  <script src="app.js?v=20261008-4"></script>
 </body>
 </html>

@@ -8,7 +8,7 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261008-3";
+const APP_VERSION = "20261008-4";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -776,8 +776,7 @@ function renderCounts() {
 function createEmptyState(message) { const element = document.createElement("p"); element.className = "empty-state"; element.textContent = message; return element; }
 
 // 印刷は現在の未読取集合のスナップショットだけを使い、履歴や完了状態へ書き込まない。
-let unreadPdfResult = null;
-let unreadPdfUrl = "";
+let unreadPdfPreviewUrl = "";
 let unreadPdfPreview = null;
 let unreadPdfBusy = false;
 function createUnreadPdfReport(now = new Date()) {
@@ -817,69 +816,103 @@ function usesDesktopPdfSave(env = globalThis) {
 }
 function renderUnreadPdfActions(env = globalThis) {
   const desktop = usesDesktopPdfSave(env);
+  const disabled = unreadPdfBusy || !state.masterInfo || !state.masterRows.length || !validateTargetPeriod().ok;
+  elements.printUnreadButton.disabled = disabled;
   elements.saveUnreadPdfButton.hidden = !desktop;
-  elements.saveUnreadPdfButton.disabled = !unreadPdfResult || unreadPdfBusy;
-  elements.shareUnreadPdfButton.hidden = desktop || !unreadPdfResult;
-  elements.shareUnreadPdfButton.disabled = !unreadPdfResult || unreadPdfBusy;
+  elements.saveUnreadPdfButton.disabled = disabled;
+  elements.shareUnreadPdfButton.hidden = desktop;
+  elements.shareUnreadPdfButton.disabled = disabled;
 }
-function saveUnreadPdf(documentRef = document) {
-  if (!unreadPdfResult || !unreadPdfUrl || unreadPdfBusy) return false;
-  // 直前に生成済みのPDFを通常ダウンロードへ渡す。再生成やWindows共有は行わない。
+
+async function generateUnreadPdf(report, env = globalThis) {
+  if (!env.ShippingPdf?.generateShippingPdf) throw new Error("PDF生成機能を読み込めません。画面を再読み込みしてください。");
+  const base = new URL("./", (env.document || document).baseURI);
+  const result = await env.ShippingPdf.generateShippingPdf(report, {
+    fontUrl: new URL("vendor/NotoSansCJKjp-PdfCommon.ttf", base).href
+  });
+  if (!result.bytes?.byteLength) throw new Error("PDFデータが空です。");
+  return result;
+}
+
+function downloadUnreadPdf(result, env = globalThis) {
+  const documentRef = env.document || document;
+  const url = URL.createObjectURL(new Blob([result.bytes], { type: "application/pdf" }));
   const link = documentRef.createElement("a");
-  link.href = unreadPdfUrl;
-  link.download = unreadPdfResult.fileName;
-  documentRef.body.append(link);
-  try { link.click(); } finally { link.remove(); }
-  return true;
+  link.href = url; link.download = result.fileName;
+  try {
+    documentRef.body.append(link);
+    link.click();
+  } finally {
+    link.remove();
+    // ダウンロード開始前のURL失効を避け、作業中のPDFデータとしては保持しない。
+    const timer = setTimeout(() => URL.revokeObjectURL(url), 60000);
+    timer?.unref?.();
+  }
 }
-async function printUnreadList() {
+
+async function generateUnreadPdfOutput(action, env = globalThis) {
   if (unreadPdfBusy) return false;
-  let report;
-  try { report = createUnreadPdfReport(); }
-  catch (error) { elements.unreadPrintMessage.textContent = error.message; return false; }
-  if (!report.rows.length) { elements.unreadPrintMessage.textContent = "未読取ラベルは0件です。印刷対象はありません。"; return false; }
-  const preview = openUnreadPdfLoadingWindow();
-  if (!preview) { elements.unreadPrintMessage.textContent = "PDF表示画面を開けません。ブラウザのポップアップ設定を確認して再度押してください。"; return false; }
   unreadPdfBusy = true;
   appUpdate.pendingOperations += 1;
-  elements.printUnreadButton.disabled = true;
-  renderUnreadPdfActions();
-  elements.unreadPrintMessage.textContent = "A4横PDFを端末内で生成しています…";
+  renderUnreadPdfActions(env);
+  let preview = null;
   try {
-    if (!globalThis.ShippingPdf?.generateShippingPdf) throw new Error("PDF生成機能を読み込めません。画面を再読み込みしてください。");
-    const base = new URL("./", document.baseURI);
-    const result = await globalThis.ShippingPdf.generateShippingPdf(report, {
-      fontUrl: new URL("vendor/NotoSansCJKjp-PdfCommon.ttf", base).href
-    });
-    if (!result.bytes?.byteLength) throw new Error("PDFデータが空です。");
-    if (preview.closed) throw new Error("PDF表示画面が閉じられています。もう一度印刷ボタンを押してください。");
-    const url = URL.createObjectURL(new Blob([result.bytes], { type: "application/pdf" }));
-    if (unreadPdfUrl) URL.revokeObjectURL(unreadPdfUrl);
-    unreadPdfUrl = url; unreadPdfResult = result; unreadPdfPreview = preview;
-    preview.location.href = url;
-    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。${result.substitutions?.length ? "表示できない文字をPDF内だけ置換しました（" + result.substitutions.map((item) => "U+" + item.codePoint.toString(16).toUpperCase() + "→" + item.replacement).join("、") + "）。" : ""}PDF画面から印刷、または「${usesDesktopPdfSave() ? "PDFを保存" : "作成したPDFを共有・保存"}」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
-    return true;
-  } catch (error) {
-    preview.close(); elements.unreadPrintMessage.textContent = `PDFを作成・表示できませんでした。${error.message}`; return false;
-  } finally { unreadPdfBusy = false; appUpdate.pendingOperations -= 1; elements.printUnreadButton.disabled = false; renderUnreadPdfActions(); }
-}
-async function shareUnreadPdf(env = globalThis) {
-  if (!unreadPdfResult || unreadPdfBusy) return false;
-  appUpdate.pendingOperations += 1;
-  try {
-    if (usesDesktopPdfSave(env)) return saveUnreadPdf(env.document || document);
-    const result = unreadPdfResult;
-    const file = new env.File([result.bytes], result.fileName, { type: "application/pdf" });
-    if (env.navigator?.canShare?.({ files: [file] })) {
-      await env.navigator.share({ title: "SPD出荷 未読取ラベル一覧", files: [file] });
-    } else {
-      return saveUnreadPdf(env.document || document);
+    // クリック時に期間・部署・マスター・完了集合から文字列のコピーを作る。
+    // 生成中に作業状態が変わっても、帳票と完了案内はこの同じコピーを使用する。
+    const report = createUnreadPdfReport();
+    if (!report.rows.length) {
+      elements.unreadPrintMessage.textContent = "未読取ラベルは0件です。出力対象はありません。";
+      return false;
     }
+    if (action === "preview") {
+      // ポップアップの表示先は、最初のawaitより前に利用者のクリック中に確保する。
+      preview = openUnreadPdfLoadingWindow(env.window || window);
+      if (!preview) throw new Error("PDF表示画面を開けません。ブラウザのポップアップ設定を確認して再度押してください。");
+    }
+    elements.unreadPrintMessage.textContent = "PDF作成中... " + report.scope + "／対象期間：" + report.period;
+    const result = await generateUnreadPdf(report, env);
+    let method;
+    if (action === "preview") {
+      if (preview.closed) throw new Error("PDF表示画面が閉じられています。もう一度印刷プレビューを押してください。");
+      const url = URL.createObjectURL(new Blob([result.bytes], { type: "application/pdf" }));
+      preview.location.href = url;
+      if (unreadPdfPreviewUrl) URL.revokeObjectURL(unreadPdfPreviewUrl);
+      unreadPdfPreviewUrl = url; unreadPdfPreview = preview;
+      method = "プレビュー表示";
+    } else if (action === "share") {
+      const file = new env.File([result.bytes], result.fileName, { type: "application/pdf" });
+      if (env.navigator?.canShare?.({ files: [file] }) && env.navigator.share) {
+        await env.navigator.share({ title: "SPD出荷 未読取ラベル一覧", files: [file] });
+        method = "共有";
+      } else {
+        downloadUnreadPdf(result, env); method = "保存";
+      }
+    } else {
+      downloadUnreadPdf(result, env); method = "保存";
+    }
+    const substitutions = result.substitutions?.length
+      ? "表示できない文字をPDF内だけ置換しました（" + result.substitutions.map((item) =>
+        "U+" + item.codePoint.toString(16).toUpperCase() + "→" + item.replacement).join("、") + "）。" : "";
+    elements.unreadPrintMessage.textContent = method + "用PDF：" + result.pageCount + "ページ。"
+      + "出力対象期間：" + report.period + "／出力対象：" + report.scope + "／未読取：" + report.rows.length + "件。"
+      + substitutions + (report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : "");
     return true;
   } catch (error) {
-    if (error.name !== "AbortError") elements.unreadPrintMessage.textContent = `PDFを共有できませんでした。PDF画面の共有・印刷を使用してください。${error.message}`;
+    preview?.close();
+    elements.unreadPrintMessage.textContent = error.name === "AbortError"
+      ? "PDFの共有をキャンセルしました。"
+      : "PDFを作成・出力できませんでした。" + error.message;
     return false;
-  } finally { appUpdate.pendingOperations -= 1; }
+  } finally {
+    unreadPdfBusy = false;
+    appUpdate.pendingOperations -= 1;
+    renderUnreadPdfActions(env);
+  }
+}
+function printUnreadList(env = globalThis) { return generateUnreadPdfOutput("preview", env); }
+function saveUnreadPdf(env = globalThis) { return generateUnreadPdfOutput("save", env); }
+function shareUnreadPdf(env = globalThis) {
+  return generateUnreadPdfOutput(usesDesktopPdfSave(env) ? "save" : "share", env);
 }
 
 function renderUnreadList() {
@@ -1349,7 +1382,7 @@ function bindEvents() {
   elements.restoreHistoryButton.addEventListener("click", () => openAdminPasswordDialog("restore")); elements.clearHistoryButton.addEventListener("click", () => openAdminPasswordDialog("delete")); elements.confirmAdminPasswordButton.addEventListener("click", confirmAdminPassword); elements.cancelAdminPasswordButton.addEventListener("click", closeAdminPasswordDialog); elements.adminPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter" && elements.adminPasswordConfirmArea.hidden) { event.preventDefault(); void confirmAdminPassword(); } }); elements.adminPasswordConfirmInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void confirmAdminPassword(); } });
   elements.chooseHistoryRestoreFilesButton.addEventListener("click", () => { elements.historyRestoreFiles.value = ""; pendingHistoryRestorePlan = null; elements.confirmHistoryRestoreButton.disabled = true; elements.historyRestoreFiles.click(); }); elements.historyRestoreFiles.addEventListener("change", analyzeSelectedHistoryBackups); elements.confirmHistoryRestoreButton.addEventListener("click", confirmHistoryRestore); elements.cancelHistoryRestoreButton.addEventListener("click", closeHistoryRestoreDialog);
   elements.printUnreadButton.addEventListener("click", () => { void printUnreadList(); });
-  elements.saveUnreadPdfButton.addEventListener("click", () => { saveUnreadPdf(); });
+  elements.saveUnreadPdfButton.addEventListener("click", () => { void saveUnreadPdf(); });
   elements.shareUnreadPdfButton.addEventListener("click", () => { void shareUnreadPdf(); });
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
