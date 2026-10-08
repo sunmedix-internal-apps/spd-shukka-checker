@@ -8,7 +8,7 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261007-1";
+const APP_VERSION = "20261008-1";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -774,6 +774,93 @@ function renderCounts() {
   elements.unreadDepartmentLabel.textContent = state.currentDepartment ? `対象部署：${state.currentDepartment.facilityName} / ${state.currentDepartment.departmentName}` : "対象部署：指定なし（全体）";
 }
 function createEmptyState(message) { const element = document.createElement("p"); element.className = "empty-state"; element.textContent = message; return element; }
+
+// 印刷は現在の未読取集合のスナップショットだけを使い、履歴や完了状態へ書き込まない。
+let unreadPdfResult = null;
+let unreadPdfUrl = "";
+let unreadPdfPreview = null;
+let unreadPdfBusy = false;
+function createUnreadPdfReport(now = new Date()) {
+  if (!state.masterInfo || !state.masterRows.length) throw new Error("先にラベルマスタ.tsvを読み込んでください。");
+  const period = validateTargetPeriod();
+  if (!period.ok) throw new Error(period.message);
+  const rows = getUnreadLabels().slice().sort((a, b) => {
+    for (const key of ["施設名称", "部署名称", "品名", "商品コード", "ラベルキー"]) {
+      const compared = String(a[key] || "").localeCompare(String(b[key] || ""), "ja");
+      if (compared) return compared;
+    }
+    return 0;
+  });
+  const missingColumns = ["商品コード", "規格", "数量"].filter((key) => !state.masterRows.some((row) => Object.hasOwn(row, key)));
+  const dates = [...new Set(rows.map((row) => row["払出予定伝票日付"]))].sort();
+  return {
+    title: "SPD出荷 未読取ラベル一覧",
+    scope: state.currentDepartment ? `指定部署：${state.currentDepartment.facilityName} / ${state.currentDepartment.departmentName}` : "全体（全施設・全部署）",
+    period: `${formatDateForDisplay(state.targetStartDate)} ～ ${formatDateForDisplay(state.targetEndDate)}`,
+    plannedDates: dates.map((date) => date.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1/$2/$3")).join("、"),
+    printedAt: formatLocalDateTime(now), fileDate: todayInputValue(now), missingColumns,
+    rows: rows.map((row, index) => [String(index + 1), "", row["施設名称"], row["部署名称"],
+      row["商品コード"] ?? "", row["品名"] ?? "", row["規格"] ?? "", row["製品番号"] ?? "", row["数量"] ?? "", row["ラベルキー"]])
+  };
+}
+function openUnreadPdfLoadingWindow(windowRef = window) {
+  try {
+    const preview = windowRef.open("about:blank", "_blank");
+    if (preview) { preview.document.title = "SPD出荷 PDF生成中"; preview.document.body.textContent = "PDFを生成しています。しばらくお待ちください。"; }
+    return preview;
+  } catch { return null; }
+}
+async function printUnreadList() {
+  if (unreadPdfBusy) return false;
+  let report;
+  try { report = createUnreadPdfReport(); }
+  catch (error) { elements.unreadPrintMessage.textContent = error.message; return false; }
+  if (!report.rows.length) { elements.unreadPrintMessage.textContent = "未読取ラベルは0件です。印刷対象はありません。"; return false; }
+  const preview = openUnreadPdfLoadingWindow();
+  if (!preview) { elements.unreadPrintMessage.textContent = "PDF表示画面を開けません。ブラウザのポップアップ設定を確認して再度押してください。"; return false; }
+  unreadPdfBusy = true;
+  appUpdate.pendingOperations += 1;
+  elements.printUnreadButton.disabled = true;
+  elements.shareUnreadPdfButton.hidden = true;
+  elements.unreadPrintMessage.textContent = "A4横PDFを端末内で生成しています…";
+  try {
+    if (!globalThis.ShippingPdf?.generateShippingPdf) throw new Error("PDF生成機能を読み込めません。画面を再読み込みしてください。");
+    const base = new URL("./", document.baseURI);
+    const result = await globalThis.ShippingPdf.generateShippingPdf(report, {
+      fontUrl: new URL("vendor/NotoSansCJKjp-PdfCommon.ttf", base).href,
+      fallbackFontUrl: new URL("vendor/NotoSansCJKjp-Regular.ttf", base).href
+    });
+    if (!result.bytes?.byteLength) throw new Error("PDFデータが空です。");
+    if (preview.closed) throw new Error("PDF表示画面が閉じられています。もう一度印刷ボタンを押してください。");
+    const url = URL.createObjectURL(new Blob([result.bytes], { type: "application/pdf" }));
+    if (unreadPdfUrl) URL.revokeObjectURL(unreadPdfUrl);
+    unreadPdfUrl = url; unreadPdfResult = result; unreadPdfPreview = preview;
+    preview.location.href = url;
+    elements.shareUnreadPdfButton.hidden = false;
+    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。PDF画面から印刷、または「作成したPDFを共有・保存」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
+    return true;
+  } catch (error) {
+    preview.close(); elements.unreadPrintMessage.textContent = `PDFを作成・表示できませんでした。${error.message}`; return false;
+  } finally { unreadPdfBusy = false; appUpdate.pendingOperations -= 1; elements.printUnreadButton.disabled = false; }
+}
+async function shareUnreadPdf(env = globalThis) {
+  if (!unreadPdfResult || unreadPdfBusy) return false;
+  appUpdate.pendingOperations += 1;
+  try {
+    const result = unreadPdfResult;
+    const file = new env.File([result.bytes], result.fileName, { type: "application/pdf" });
+    if (env.navigator?.canShare?.({ files: [file] })) {
+      await env.navigator.share({ title: "SPD出荷 未読取ラベル一覧", files: [file] });
+    } else {
+      const link = document.createElement("a"); link.href = unreadPdfUrl; link.download = result.fileName; link.click();
+    }
+    return true;
+  } catch (error) {
+    if (error.name !== "AbortError") elements.unreadPrintMessage.textContent = `PDFを共有できませんでした。PDF画面の共有・印刷を使用してください。${error.message}`;
+    return false;
+  } finally { appUpdate.pendingOperations -= 1; }
+}
+
 function renderUnreadList() {
   elements.unreadList.replaceChildren();
   if (!state.masterInfo) { elements.unreadList.append(createEmptyState("マスターを読み込んでください。")); return; }
@@ -1219,7 +1306,7 @@ async function confirmAdminPassword() {
   } catch (error) { elements.adminPasswordError.textContent = error.message || "管理者認証に失敗しました。"; elements.adminPasswordInput.focus(); return false; }
 }
 function cacheElements() {
-  ["masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
+  ["masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
@@ -1239,11 +1326,13 @@ function bindEvents() {
   elements.configureHistoryBackupButton.addEventListener("click", handleConfigureHistoryBackup); elements.shippingBackupSetupButton.addEventListener("click", handleConfigureHistoryBackup);
   elements.restoreHistoryButton.addEventListener("click", () => openAdminPasswordDialog("restore")); elements.clearHistoryButton.addEventListener("click", () => openAdminPasswordDialog("delete")); elements.confirmAdminPasswordButton.addEventListener("click", confirmAdminPassword); elements.cancelAdminPasswordButton.addEventListener("click", closeAdminPasswordDialog); elements.adminPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter" && elements.adminPasswordConfirmArea.hidden) { event.preventDefault(); void confirmAdminPassword(); } }); elements.adminPasswordConfirmInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void confirmAdminPassword(); } });
   elements.chooseHistoryRestoreFilesButton.addEventListener("click", () => { elements.historyRestoreFiles.value = ""; pendingHistoryRestorePlan = null; elements.confirmHistoryRestoreButton.disabled = true; elements.historyRestoreFiles.click(); }); elements.historyRestoreFiles.addEventListener("change", analyzeSelectedHistoryBackups); elements.confirmHistoryRestoreButton.addEventListener("click", confirmHistoryRestore); elements.cancelHistoryRestoreButton.addEventListener("click", closeHistoryRestoreDialog);
+  elements.printUnreadButton.addEventListener("click", () => { void printUnreadList(); });
+  elements.shareUnreadPdfButton.addEventListener("click", () => { void shareUnreadPdf(); });
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
 async function init() { cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll(); await Promise.all([loadScanHistory(), restoreHistoryBackup()]); renderAll(); const backupBlock = getShippingBackupBlockResult(); if (backupBlock) showResult("ng", backupBlock.title, backupBlock.message, []); else if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []); else if (!state.currentDepartment) showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); else if (!hasWorkerCode()) { showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true, "worker"); } else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []); document.body.dataset.appReady = "true"; }
 function isAppUpdateSafe() {
-  return appUpdate.ready && appUpdate.pendingOperations === 0 && !state.pendingSpdLabel
+  return appUpdate.ready && appUpdate.pendingOperations === 0 && !unreadPdfBusy && (!unreadPdfPreview || unreadPdfPreview.closed) && !state.pendingSpdLabel
     && !["product", "employee"].includes(state.mode) && !state.scannerBuffer
     && !["workerCodeDialog", "departmentSearchDialog", "adminPasswordDialog", "historyRestoreDialog", "skipBarcodePreview"]
       .some((id) => elements[id] && !elements[id].hidden);
@@ -1374,7 +1463,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = {
   state, FACILITY_CENTER_MAP, parseTsv, normalizeQr, buildLabelKey, getExpectedCenterCode, rebuildIndexes, findLabel,
   parseContainerBarcode, setContainerDepartment, clearContainerDepartment, reconcileCurrentDepartment, getMasterDepartments, filterMasterDepartments, selectDepartment,
   validateSpdLabel, setPendingSpdLabel, acceptPendingSpdLabel, cancelPendingSpdLabel, validateTargetPeriod, getCurrentTargetLabels,
-  getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
+  createUnreadPdfReport, printUnreadList, shareUnreadPdf, openUnreadPdfLoadingWindow, getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
   extractJanFromBarcode, validateProductBarcode, completeItemCheck, canSkip, canConfirmSkip, startSkipProcess, executeSkip, cancelSkipProcess, processProductScanValue,
   createHistoryRecord, saveScanHistory, loadScanHistory, clearScanHistory, filterHistory, buildHistoryCsv,
   shareHistoryCsv, handleContainerDepartmentScan, applyMasterData, isValidDateKey, normalizeLabelKey,
