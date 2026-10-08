@@ -275,7 +275,7 @@
       const replacement = candidates.find((candidate) => candidate && canDisplayText(font, candidate));
       if (!replacement) throw new Error("PDF用フォントで代替文字も表示できません。フォント資材を再読み込みしてください。");
       const previous = substitutions.get(codePoint);
-      substitutions.set(codePoint, { codePoint, replacement, count: (previous?.count || 0) + 1 });
+      substitutions.set(codePoint, { codePoint, original: character, replacement, count: (previous?.count || 0) + 1 });
       output += replacement;
     }
     return output;
@@ -292,18 +292,10 @@
   }
 
   async function chooseCompatibleFontBytes(fontkitRef, report, options) {
-    const primaryBytes = await loadPrimaryFontBytes(options);
-    // 改行はレイアウト命令であり、フォントの収録文字から除外する。
-    const missing = findMissingCodePoints(fontkitRef, primaryBytes, report).filter((point) => ![9, 10, 13].includes(point));
-    if (!missing.length) return primaryBytes;
-    // 完全フォントで原文を優先。取得失敗時も同梱フォントと代替文字で続行する。
-    try {
-      return options.fallbackFontBytes
-        || await fetchFontBytes(options.fallbackFontUrl || "./vendor/NotoSansCJKjp-Regular.ttf", "PDF用日本語完全フォント", options);
-    } catch (error) {
-      console.warn("[SPD出荷チェッカー PDF] 完全フォントを取得できないため、同梱フォントと代替文字で出力します。", error);
-      return primaryBytes;
-    }
+    // 棚卸くんと同じ事前作成済み軽量TTFを使用する。
+    // 未対応文字は、この実際に埋め込むフォントで判定してPDF専用コピー内で置換する。
+    // 一文字のために大容量の完全フォントへ切り替えない。動的サブセット化もしない。
+    return loadPrimaryFontBytes(options);
   }
 
   function validateReportLayout(report) {

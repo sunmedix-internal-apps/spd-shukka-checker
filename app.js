@@ -8,7 +8,7 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261008-2";
+const APP_VERSION = "20261008-3";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -810,6 +810,28 @@ function openUnreadPdfLoadingWindow(windowRef = window) {
     return preview;
   } catch { return null; }
 }
+function usesDesktopPdfSave(env = globalThis) {
+  // 既存のPC向け保存APIとマウス操作の能力で判断する。画面幅やUser-Agentは使わない。
+  return isHistoryBackupSupported(env)
+    || Boolean(env.matchMedia?.("(hover: hover) and (pointer: fine)").matches);
+}
+function renderUnreadPdfActions(env = globalThis) {
+  const desktop = usesDesktopPdfSave(env);
+  elements.saveUnreadPdfButton.hidden = !desktop;
+  elements.saveUnreadPdfButton.disabled = !unreadPdfResult || unreadPdfBusy;
+  elements.shareUnreadPdfButton.hidden = desktop || !unreadPdfResult;
+  elements.shareUnreadPdfButton.disabled = !unreadPdfResult || unreadPdfBusy;
+}
+function saveUnreadPdf(documentRef = document) {
+  if (!unreadPdfResult || !unreadPdfUrl || unreadPdfBusy) return false;
+  // 直前に生成済みのPDFを通常ダウンロードへ渡す。再生成やWindows共有は行わない。
+  const link = documentRef.createElement("a");
+  link.href = unreadPdfUrl;
+  link.download = unreadPdfResult.fileName;
+  documentRef.body.append(link);
+  try { link.click(); } finally { link.remove(); }
+  return true;
+}
 async function printUnreadList() {
   if (unreadPdfBusy) return false;
   let report;
@@ -821,14 +843,13 @@ async function printUnreadList() {
   unreadPdfBusy = true;
   appUpdate.pendingOperations += 1;
   elements.printUnreadButton.disabled = true;
-  elements.shareUnreadPdfButton.hidden = true;
+  renderUnreadPdfActions();
   elements.unreadPrintMessage.textContent = "A4横PDFを端末内で生成しています…";
   try {
     if (!globalThis.ShippingPdf?.generateShippingPdf) throw new Error("PDF生成機能を読み込めません。画面を再読み込みしてください。");
     const base = new URL("./", document.baseURI);
     const result = await globalThis.ShippingPdf.generateShippingPdf(report, {
-      fontUrl: new URL("vendor/NotoSansCJKjp-PdfCommon.ttf", base).href,
-      fallbackFontUrl: new URL("vendor/NotoSansCJKjp-Regular.ttf", base).href
+      fontUrl: new URL("vendor/NotoSansCJKjp-PdfCommon.ttf", base).href
     });
     if (!result.bytes?.byteLength) throw new Error("PDFデータが空です。");
     if (preview.closed) throw new Error("PDF表示画面が閉じられています。もう一度印刷ボタンを押してください。");
@@ -836,23 +857,23 @@ async function printUnreadList() {
     if (unreadPdfUrl) URL.revokeObjectURL(unreadPdfUrl);
     unreadPdfUrl = url; unreadPdfResult = result; unreadPdfPreview = preview;
     preview.location.href = url;
-    elements.shareUnreadPdfButton.hidden = false;
-    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。${result.substitutions?.length ? "表示できない文字をPDF内だけ置換しました（" + result.substitutions.map((item) => "U+" + item.codePoint.toString(16).toUpperCase() + "→" + item.replacement).join("、") + "）。" : ""}PDF画面から印刷、または「作成したPDFを共有・保存」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
+    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。${result.substitutions?.length ? "表示できない文字をPDF内だけ置換しました（" + result.substitutions.map((item) => "U+" + item.codePoint.toString(16).toUpperCase() + "→" + item.replacement).join("、") + "）。" : ""}PDF画面から印刷、または「${usesDesktopPdfSave() ? "PDFを保存" : "作成したPDFを共有・保存"}」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
     return true;
   } catch (error) {
     preview.close(); elements.unreadPrintMessage.textContent = `PDFを作成・表示できませんでした。${error.message}`; return false;
-  } finally { unreadPdfBusy = false; appUpdate.pendingOperations -= 1; elements.printUnreadButton.disabled = false; }
+  } finally { unreadPdfBusy = false; appUpdate.pendingOperations -= 1; elements.printUnreadButton.disabled = false; renderUnreadPdfActions(); }
 }
 async function shareUnreadPdf(env = globalThis) {
   if (!unreadPdfResult || unreadPdfBusy) return false;
   appUpdate.pendingOperations += 1;
   try {
+    if (usesDesktopPdfSave(env)) return saveUnreadPdf(env.document || document);
     const result = unreadPdfResult;
     const file = new env.File([result.bytes], result.fileName, { type: "application/pdf" });
     if (env.navigator?.canShare?.({ files: [file] })) {
       await env.navigator.share({ title: "SPD出荷 未読取ラベル一覧", files: [file] });
     } else {
-      const link = document.createElement("a"); link.href = unreadPdfUrl; link.download = result.fileName; link.click();
+      return saveUnreadPdf(env.document || document);
     }
     return true;
   } catch (error) {
@@ -862,6 +883,7 @@ async function shareUnreadPdf(env = globalThis) {
 }
 
 function renderUnreadList() {
+  renderUnreadPdfActions();
   elements.unreadList.replaceChildren();
   if (!state.masterInfo) { elements.unreadList.append(createEmptyState("マスターを読み込んでください。")); return; }
   const period = validateTargetPeriod(); if (!period.ok) { elements.unreadList.append(createEmptyState(`対象期間を修正してください。${period.message}`)); return; }
@@ -1306,7 +1328,7 @@ async function confirmAdminPassword() {
   } catch (error) { elements.adminPasswordError.textContent = error.message || "管理者認証に失敗しました。"; elements.adminPasswordInput.focus(); return false; }
 }
 function cacheElements() {
-  ["masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
+  ["masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
@@ -1327,6 +1349,7 @@ function bindEvents() {
   elements.restoreHistoryButton.addEventListener("click", () => openAdminPasswordDialog("restore")); elements.clearHistoryButton.addEventListener("click", () => openAdminPasswordDialog("delete")); elements.confirmAdminPasswordButton.addEventListener("click", confirmAdminPassword); elements.cancelAdminPasswordButton.addEventListener("click", closeAdminPasswordDialog); elements.adminPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter" && elements.adminPasswordConfirmArea.hidden) { event.preventDefault(); void confirmAdminPassword(); } }); elements.adminPasswordConfirmInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void confirmAdminPassword(); } });
   elements.chooseHistoryRestoreFilesButton.addEventListener("click", () => { elements.historyRestoreFiles.value = ""; pendingHistoryRestorePlan = null; elements.confirmHistoryRestoreButton.disabled = true; elements.historyRestoreFiles.click(); }); elements.historyRestoreFiles.addEventListener("change", analyzeSelectedHistoryBackups); elements.confirmHistoryRestoreButton.addEventListener("click", confirmHistoryRestore); elements.cancelHistoryRestoreButton.addEventListener("click", closeHistoryRestoreDialog);
   elements.printUnreadButton.addEventListener("click", () => { void printUnreadList(); });
+  elements.saveUnreadPdfButton.addEventListener("click", () => { saveUnreadPdf(); });
   elements.shareUnreadPdfButton.addEventListener("click", () => { void shareUnreadPdf(); });
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
@@ -1463,7 +1486,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = {
   state, FACILITY_CENTER_MAP, parseTsv, normalizeQr, buildLabelKey, getExpectedCenterCode, rebuildIndexes, findLabel,
   parseContainerBarcode, setContainerDepartment, clearContainerDepartment, reconcileCurrentDepartment, getMasterDepartments, filterMasterDepartments, selectDepartment,
   validateSpdLabel, setPendingSpdLabel, acceptPendingSpdLabel, cancelPendingSpdLabel, validateTargetPeriod, getCurrentTargetLabels,
-  createUnreadPdfReport, printUnreadList, shareUnreadPdf, openUnreadPdfLoadingWindow, getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
+  usesDesktopPdfSave, saveUnreadPdf, createUnreadPdfReport, printUnreadList, shareUnreadPdf, openUnreadPdfLoadingWindow, getUnreadLabels, getTargetCounts, normalizeJanForComparison, detectProductBarcodeType, parseGs1Barcode,
   extractJanFromBarcode, validateProductBarcode, completeItemCheck, canSkip, canConfirmSkip, startSkipProcess, executeSkip, cancelSkipProcess, processProductScanValue,
   createHistoryRecord, saveScanHistory, loadScanHistory, clearScanHistory, filterHistory, buildHistoryCsv,
   shareHistoryCsv, handleContainerDepartmentScan, applyMasterData, isValidDateKey, normalizeLabelKey,
