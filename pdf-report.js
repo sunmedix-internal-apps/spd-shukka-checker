@@ -260,21 +260,50 @@
     return [...collectReportCodePoints(report)].filter((codePoint) => !parsedFont.hasGlyphForCodePoint(codePoint));
   }
 
+  function canDisplayText(font, value) {
+    return [...value].every((character) => character === "\n" || font.hasGlyphForCodePoint(character.codePointAt(0)));
+  }
+
+  function replaceUnsupportedText(value, font, substitutions) {
+    const aliases = { "≒": "約", "≈": "約", "≤": "<=", "≥": ">=", "±": "+/-" };
+    let output = "";
+    for (const character of textValue(value).replace(/\r\n?/g, "\n").replace(/\t/g, "    ")) {
+      if (canDisplayText(font, character)) { output += character; continue; }
+      const codePoint = character.codePointAt(0);
+      const normalized = character.normalize("NFKC");
+      const candidates = [aliases[character], normalized !== character ? normalized : "", "[U+" + codePoint.toString(16).toUpperCase() + "]", "?"];
+      const replacement = candidates.find((candidate) => candidate && canDisplayText(font, candidate));
+      if (!replacement) throw new Error("PDF用フォントで代替文字も表示できません。フォント資材を再読み込みしてください。");
+      const previous = substitutions.get(codePoint);
+      substitutions.set(codePoint, { codePoint, replacement, count: (previous?.count || 0) + 1 });
+      output += replacement;
+    }
+    return output;
+  }
+
+  function prepareReportText(report, font, substitutions) {
+    // PDF専用コピーだけを更新する。マスター・画面・履歴は変更しない。
+    for (const [key, value] of Object.entries(report)) {
+      if (typeof value === "string") report[key] = replaceUnsupportedText(value, font, substitutions);
+    }
+    report.headers = report.headers.map((value) => replaceUnsupportedText(value, font, substitutions));
+    report.rows = report.rows.map((row) => row.map((value) => replaceUnsupportedText(value, font, substitutions)));
+    report.sections.forEach((section) => prepareReportText(section, font, substitutions));
+  }
+
   async function chooseCompatibleFontBytes(fontkitRef, report, options) {
     const primaryBytes = await loadPrimaryFontBytes(options);
-    const missing = findMissingCodePoints(fontkitRef, primaryBytes, report);
+    // 改行はレイアウト命令であり、フォントの収録文字から除外する。
+    const missing = findMissingCodePoints(fontkitRef, primaryBytes, report).filter((point) => ![9, 10, 13].includes(point));
     if (!missing.length) return primaryBytes;
-
-    console.warn("[SPD出荷チェッカー PDF] 事前サブセット外の文字を検出したため完全フォントへ切り替えます。", {
-      codePoints: missing.map((codePoint) => `U+${codePoint.toString(16).toUpperCase()}`)
-    });
-    const fallbackBytes = options.fallbackFontBytes
-      || await fetchFontBytes(options.fallbackFontUrl || "./vendor/NotoSansCJKjp-Regular.ttf", "PDF用日本語完全フォント", options);
-    const fallbackMissing = findMissingCodePoints(fontkitRef, fallbackBytes, report);
-    if (fallbackMissing.length) {
-      throw new Error(`PDF用日本語フォントに含まれない文字があります（${fallbackMissing.map((codePoint) => `U+${codePoint.toString(16).toUpperCase()}`).join(", ")}）。`);
+    // 完全フォントで原文を優先。取得失敗時も同梱フォントと代替文字で続行する。
+    try {
+      return options.fallbackFontBytes
+        || await fetchFontBytes(options.fallbackFontUrl || "./vendor/NotoSansCJKjp-Regular.ttf", "PDF用日本語完全フォント", options);
+    } catch (error) {
+      console.warn("[SPD出荷チェッカー PDF] 完全フォントを取得できないため、同梱フォントと代替文字で出力します。", error);
+      return primaryBytes;
     }
-    return fallbackBytes;
   }
 
   function validateReportLayout(report) {
@@ -323,8 +352,11 @@
     if (!pdfLib?.PDFDocument || !pdfLib?.rgb) throw new Error("PDF生成ライブラリを読み込めません。");
     if (!fontkitRef) throw new Error("日本語フォント処理ライブラリを読み込めません。");
     const report = normalizeReport(inputReport || {});
-    const sections = report.sections.length ? report.sections : [report];
     const fontBytes = await chooseCompatibleFontBytes(fontkitRef, report, options);
+    const parsedFont = fontkitRef.create(fontBytes instanceof Uint8Array ? fontBytes : new Uint8Array(fontBytes));
+    const substitutions = new Map();
+    prepareReportText(report, parsedFont, substitutions);
+    const sections = report.sections.length ? report.sections : [report];
     const pdfDoc = await pdfLib.PDFDocument.create();
     pdfDoc.registerFontkit(fontkitRef);
     // iOS標準PDFビューアとの互換性を優先し、通常のcmapを持つ事前サブセットTTFを完全埋込みする。
@@ -338,13 +370,18 @@
 
     sections.forEach((section) => drawReportSection(pdfDoc, section, fonts, pdfLib));
 
+    if (substitutions.size) {
+      const page = pdfDoc.getPages().at(-1);
+      page.drawText("※一部の文字をPDF表示用に置換しています。原文はラベルマスタで確認してください。", {
+        x: PAGE_MARGIN, y: PAGE_MARGIN + 6, size: 7, font });
+    }
     pdfDoc.getPages().forEach((page, index, pages) => {
       const label = `${index + 1} / ${pages.length} ページ`;
       page.drawText(label, { x: (page.getWidth() - font.widthOfTextAtSize(label, 8)) / 2,
         y: PAGE_MARGIN - 10, size: 8, font });
     });
     const bytes = await pdfDoc.save();
-    return { bytes, fileName: buildPdfFilename(report), pageCount: pdfDoc.getPageCount() };
+    return { bytes, fileName: buildPdfFilename(report), pageCount: pdfDoc.getPageCount(), substitutions: [...substitutions.values()] };
   }
 
   return {

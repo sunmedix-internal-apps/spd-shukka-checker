@@ -8,7 +8,7 @@ const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261008-1";
+const APP_VERSION = "20261008-2";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -791,7 +791,7 @@ function createUnreadPdfReport(now = new Date()) {
     }
     return 0;
   });
-  const missingColumns = ["商品コード", "規格", "数量"].filter((key) => !state.masterRows.some((row) => Object.hasOwn(row, key)));
+  const missingColumns = ["商品コード", "規格"].filter((key) => !state.masterRows.some((row) => Object.hasOwn(row, key)));
   const dates = [...new Set(rows.map((row) => row["払出予定伝票日付"]))].sort();
   return {
     title: "SPD出荷 未読取ラベル一覧",
@@ -800,7 +800,7 @@ function createUnreadPdfReport(now = new Date()) {
     plannedDates: dates.map((date) => date.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1/$2/$3")).join("、"),
     printedAt: formatLocalDateTime(now), fileDate: todayInputValue(now), missingColumns,
     rows: rows.map((row, index) => [String(index + 1), "", row["施設名称"], row["部署名称"],
-      row["商品コード"] ?? "", row["品名"] ?? "", row["規格"] ?? "", row["製品番号"] ?? "", row["数量"] ?? "", row["ラベルキー"]])
+      row["商品コード"] ?? "", row["品名"] ?? "", row["規格"] ?? "", row["製品番号"] ?? "", "1" + normalizeValue(row["単位名"]), row["ラベルキー"]])
   };
 }
 function openUnreadPdfLoadingWindow(windowRef = window) {
@@ -837,7 +837,7 @@ async function printUnreadList() {
     unreadPdfUrl = url; unreadPdfResult = result; unreadPdfPreview = preview;
     preview.location.href = url;
     elements.shareUnreadPdfButton.hidden = false;
-    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。PDF画面から印刷、または「作成したPDFを共有・保存」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
+    elements.unreadPrintMessage.textContent = `${report.rows.length}件・${result.pageCount}ページのPDFを作成しました。${result.substitutions?.length ? "表示できない文字をPDF内だけ置換しました（" + result.substitutions.map((item) => "U+" + item.codePoint.toString(16).toUpperCase() + "→" + item.replacement).join("、") + "）。" : ""}PDF画面から印刷、または「作成したPDFを共有・保存」を使用してください。${report.missingColumns.length ? "マスターにない列は空欄です：" + report.missingColumns.join("、") : ""}`;
     return true;
   } catch (error) {
     preview.close(); elements.unreadPrintMessage.textContent = `PDFを作成・表示できませんでした。${error.message}`; return false;
