@@ -11,7 +11,7 @@
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
   <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
-  <link rel="stylesheet" href="style.css?v=20261008-4">
+  <link rel="stylesheet" href="style.css?v=20261014-2">
 </head>
 <body>
   <div class="app-shell">
@@ -39,6 +39,7 @@
         <div><strong id="shippingBackupGateTitle">履歴バックアップ：確認中</strong><p id="shippingBackupGateMessage">保存先の状態を確認しています。</p></div>
         <button id="shippingBackupSetupButton" class="button button--secondary" type="button" disabled>バックアップ先を設定</button>
       </section>
+      <button id="retryHistorySaveButton" class="button button--danger-light" type="button" hidden>履歴保存を再試行</button>
 
       <section class="department-card" aria-labelledby="departmentHeading">
         <div class="department-heading-row">
@@ -126,7 +127,8 @@
         <div class="history-select-row"><select id="historyFacility" aria-label="施設"><option value="">すべての施設</option></select><select id="historyDepartment" aria-label="部署"><option value="">すべての部署</option></select></div>
         <div class="history-select-row"><select id="historyResult" aria-label="判定"><option value="">すべての判定</option><option value="OK">OK</option><option value="SKIP">SKIP</option><option value="NG">NG</option></select><input id="historySearch" type="search" placeholder="製品・ラベル・JAN・社員コード"></div>
       </section>
-      <div class="history-actions"><button id="shareHistoryButton" class="button button--secondary" type="button">CSV出力</button><button id="configureHistoryBackupButton" class="button button--secondary" type="button">履歴バックアップ先設定</button></div>
+      <div class="history-actions"><button id="shareHistoryButton" class="button button--secondary" type="button">CSV出力</button></div>
+      <details class="backup-management"><summary>バックアップ管理（管理者）</summary><p class="help-text">指定先：C:\システム\SPD出荷チェッカー\読取履歴<br>管理者が初回登録します。登録・変更はラベルマスタ取込後、部署指定前に操作してください。完全なパスはフォルダ選択画面で確認してください。</p><button id="configureHistoryBackupButton" class="button button--secondary" type="button">バックアップ先登録・再設定（管理者）</button></details>
       <p id="historyBackupStatus" class="backup-status" aria-live="polite">履歴バックアップ：確認中</p>
       <p id="historyMessage" class="inline-message" aria-live="polite"></p>
       <div id="historyList" class="history-list"></div>
@@ -189,6 +191,7 @@
       <p id="adminPasswordError" class="field-error" role="alert"></p>
       <div class="admin-password-actions">
         <button id="confirmAdminPasswordButton" class="button" type="button">確認</button>
+        <button id="chooseBackupFolderButton" class="button" type="button" hidden>指定フォルダを選択</button>
         <button id="cancelAdminPasswordButton" class="button button--secondary" type="button">キャンセル</button>
       </div>
     </div>
@@ -228,7 +231,7 @@
   <script src="vendor/pdf-lib.min.js"></script>
   <script src="vendor/fontkit.umd.min.js"></script>
   <script src="vendor/pdf-font-data.js"></script>
-  <script src="pdf-report.js?v=20261008-4"></script>
-  <script src="app.js?v=20261008-4"></script>
+  <script src="pdf-report.js?v=20261014-2"></script>
+  <script src="app.js?v=20261014-2"></script>
 </body>
 </html>

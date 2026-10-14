@@ -5,10 +5,12 @@ const HISTORY_DB_NAME = "spd-shipping-history-v1";
 const HISTORY_STORE_NAME = "scanHistory";
 const HISTORY_SETTINGS_STORE_NAME = "settings";
 const BACKUP_DIRECTORY_KEY = "historyBackupDirectory";
+const PENDING_BACKUP_IDS_KEY = "pendingHistoryBackupIds";
+const BACKUP_PATH = "C:\\システム\\SPD出荷チェッカー\\読取履歴";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261008-4";
+const APP_VERSION = "20261014-2";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -48,7 +50,8 @@ const state = {
   readLabelKeys: new Set(), processedResults: new Map(), history: [],
   targetStartDate: "", targetEndDate: "", currentDepartment: null, workerCode: "",
   mode: "container", pendingSpdLabel: null, scannerBuffer: "", scannerTimer: null,
-  backupDirectoryHandle: null, backupStatus: "checking"
+  backupDirectoryHandle: null, backupStatus: "checking", backupReason: "", backupPreparation: false,
+  historySaveError: "", historySaving: false, failedHistoryRecord: null, workSessionId: "", backupSetupBusy: false, initializing: false
 };
 let successSound = null;
 let productSuccessSound = null;
@@ -63,6 +66,10 @@ let adminPasswordReturnFocus = null;
 let historyRestoreReturnFocus = null;
 let pendingHistoryRestorePlan = null;
 let backupWriteQueue = Promise.resolve();
+const pendingHistoryBackupIds = new Set();
+let historyPersistenceQueue = Promise.resolve();
+let backupAdminAuthorized = false;
+let workerConfirmBusy = false;
 
 function normalizeHeader(value) { return String(value ?? "").replace(/^\uFEFF/, "").trim(); }
 function normalizeValue(value) { return String(value ?? "").trim(); }
@@ -244,11 +251,13 @@ function departmentFromRow(row) {
 }
 function getMasterDepartments() { return uniqueDepartmentCandidates(state.masterRows).map(departmentFromRow); }
 function selectDepartment(department) {
+  if (state.historySaving || state.historySaveError) return historyStorageBlockResult();
   if (!state.masterInfo || !state.masterRows.length) return { ok: false, code: "NO_MASTER", title: "マスター未読込", message: "先にラベルマスタ.tsvを読み込んでください。" };
   const key = containerIndexKey(normalizeValue(department?.facilityCode), normalizeValue(department?.departmentCode));
   const candidates = uniqueDepartmentCandidates(state.containerIndex.get(key) || []).filter((row) => row["施設名称"] === normalizeValue(department?.facilityName) && row["部署名称"] === normalizeValue(department?.departmentName));
   if (candidates.length !== 1) return { ok: false, code: "DEPARTMENT_NOT_FOUND", title: "部署を指定できません", message: "選択した施設・部署をマスターから一意に特定できません。" };
   state.currentDepartment = departmentFromRow(candidates[0]);
+  state.backupPreparation = false;
   state.workerCode = ""; state.pendingSpdLabel = null; state.mode = "spd"; saveState();
   return { ok: true, code: "DEPARTMENT_OK", department: state.currentDepartment };
 }
@@ -469,6 +478,7 @@ function createHistoryRecord({ result, detail = "", pending = null, product = nu
   const source = pending || state.pendingSpdLabel, row = source?.row || {}, now = new Date().toISOString();
   return {
     historyId: createHistoryId(),
+    workSessionId: state.workSessionId,
     eventAt: now, completedAt, spdReadAt: source?.spdReadAt || "", productReadAt: product?.readAt || (product ? now : ""),
     facilityCode: row["施設コード"] || state.currentDepartment?.facilityCode || "", facilityName: row["施設名称"] || state.currentDepartment?.facilityName || "",
     departmentCode: row["部署コード"] || state.currentDepartment?.departmentCode || "", departmentName: row["部署名称"] || state.currentDepartment?.departmentName || "",
@@ -508,27 +518,54 @@ async function setHistorySetting(key, value) {
 }
 async function saveScanHistory(record) {
   if (!record.historyId) record.historyId = createHistoryId();
-  state.history.push(record); renderHistoryIfReady();
+  state.historySaving = true;
   try {
     const db = await openHistoryDb();
-    if (db) await new Promise((resolve, reject) => {
-      const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite"), request = transaction.objectStore(HISTORY_STORE_NAME).add(record);
-      request.onsuccess = () => { record.id = request.result; };
-      transaction.oncomplete = resolve;
+    if (!db) throw new Error("ブラウザの履歴保存領域を利用できません。");
+    // 履歴とCSV未保存IDを同じトランザクションで確定する。外部CSVの成功とは分離する。
+    const persist = async () => new Promise((resolve, reject) => {
+      const backup = isHistoryBackupSupported();
+      const nextIds = new Set(pendingHistoryBackupIds);
+      if (backup) nextIds.add(record.historyId);
+      const transaction = db.transaction([HISTORY_STORE_NAME, HISTORY_SETTINGS_STORE_NAME], "readwrite");
+      const request = transaction.objectStore(HISTORY_STORE_NAME).add(record);
+      let id;
+      request.onsuccess = () => { id = request.result; };
+      if (backup) transaction.objectStore(HISTORY_SETTINGS_STORE_NAME).put({ key: PENDING_BACKUP_IDS_KEY, value: [...nextIds] });
+      transaction.oncomplete = () => { record.id = id; if (backup) pendingHistoryBackupIds.add(record.historyId); resolve(); };
       transaction.onerror = transaction.onabort = () => reject(transaction.error || request.error || new Error("履歴を保存できません。"));
     });
-  } catch (error) { console.error("読取履歴をIndexedDBへ保存できません。", error); }
-  enqueueHistoryBackup(record);
-  return record;
+    const saving = historyPersistenceQueue.then(persist);
+    historyPersistenceQueue = saving.catch(() => {});
+    await saving;
+    state.history.push(record); renderHistoryIfReady(); renderShippingBackupGate();
+    void enqueueHistoryBackup(record);
+    return record;
+  } catch (error) {
+    state.historySaveError = error.message || "履歴を保存できません。";
+    state.failedHistoryRecord = record;
+    showResult("ng", "履歴保存失敗・作業停止", "ブラウザ内履歴を保存できません。読取状態は保持しています。再読込やマスター再取込をせず、保存を再試行してください。", []);
+    throw error;
+  } finally { state.historySaving = false; renderShippingBackupGate(); }
 }
 async function loadScanHistory() {
   try {
     const db = await openHistoryDb();
-    if (db) state.history = await new Promise((resolve, reject) => { const request = db.transaction(HISTORY_STORE_NAME, "readonly").objectStore(HISTORY_STORE_NAME).getAll(); request.onsuccess = () => resolve(request.result || []); request.onerror = () => reject(request.error); });
-  } catch (error) { console.error("読取履歴を読み込めません。", error); }
+    if (!db) throw new Error("内部履歴保存領域を利用できません。");
+    state.history = await new Promise((resolve, reject) => { const request = db.transaction(HISTORY_STORE_NAME, "readonly").objectStore(HISTORY_STORE_NAME).getAll(); request.onsuccess = () => resolve(request.result || []); request.onerror = () => reject(request.error); });
+  } catch (error) { state.historySaveError = "内部履歴を読み込めません。管理者へ連絡してください。"; console.error("読取履歴を読み込めません。", error); }
   renderHistoryIfReady(); return state.history;
 }
+async function loadPendingHistoryBackupIds() {
+  try {
+    const saved = await getHistorySetting(PENDING_BACKUP_IDS_KEY);
+    pendingHistoryBackupIds.clear();
+    if (Array.isArray(saved)) saved.map(normalizeValue).filter(Boolean).forEach((historyId) => pendingHistoryBackupIds.add(historyId));
+  } catch (error) { console.error("保留中の履歴バックアップ情報を読み込めません。", error); }
+  return pendingHistoryBackupIds;
+}
 async function clearScanHistory() {
+  if (pendingHistoryBackupIds.size) throw new Error("バックアップ保留履歴があります。バックアップ完了後に削除してください。");
   const db = await openHistoryDb();
   if (db) await new Promise((resolve, reject) => {
     const transaction = db.transaction(HISTORY_STORE_NAME, "readwrite"), request = transaction.objectStore(HISTORY_STORE_NAME).clear();
@@ -542,17 +579,21 @@ function saveNgHistory(result, product = null) {
   return saveScanHistory(createHistoryRecord({ result: "NG", detail: result.title || result.code || "NG", pending, product }));
 }
 function didCompleteTarget(before, after) { return Boolean(state.currentDepartment) && validateTargetPeriod().ok && before.target > 0 && before.unread > 0 && after.unread === 0; }
-function completeItemCheck(rawValue, effects = {}) {
+async function completeItemCheck(rawValue, effects = {}) {
+  if (state.historySaveError || state.historySaving) return historyStorageBlockResult();
   const validation = validateProductBarcode(rawValue);
   if (!validation.ok) {
     if (state.pendingSpdLabel && validation.product) state.pendingSpdLabel.lastProductAttempt = validation.product;
-    saveState(); void saveNgHistory(validation, validation.product || null); (effects.playAlert || playAlertSound)();
+    saveState();
+    try { await saveNgHistory(validation, validation.product || null); } catch { return historyStorageBlockResult(); }
+    (effects.playAlert || playAlertSound)();
     return { ...validation, completed: false, counts: getTargetCounts() };
   }
   const beforeCounts = getTargetCounts(), pending = state.pendingSpdLabel;
-  state.readLabelKeys.add(pending.labelKey); state.processedResults.set(pending.labelKey, "OK");
   const record = createHistoryRecord({ result: "OK", detail: "商品一致", pending, product: validation.product, completedAt: new Date().toISOString() });
-  state.pendingSpdLabel = null; state.mode = "spd"; saveState(); void saveScanHistory(record);
+  try { await saveScanHistory(record); } catch { return historyStorageBlockResult(); }
+  state.readLabelKeys.add(pending.labelKey); state.processedResults.set(pending.labelKey, "OK");
+  state.pendingSpdLabel = null; state.mode = "spd"; saveState();
   const afterCounts = getTargetCounts(), targetCompleted = didCompleteTarget(beforeCounts, afterCounts);
   if (targetCompleted) (effects.playCompletion || playCompletionSound)();
   else (effects.playProductSuccess || effects.playSuccess || playProductSuccessSound)();
@@ -567,21 +608,24 @@ function canConfirmSkip() {
     && validateTargetPeriod().ok && isRowInTargetPeriod(state.pendingSpdLabel.row) && matchesCurrentDepartment(state.pendingSpdLabel.row));
 }
 function startSkipProcess() {
+  if (state.historySaving || state.historySaveError) return historyStorageBlockResult();
   if (!hasWorkerCode()) return { ok: false, code: "NO_WORKER", title: "作業者未指定", message: "作業者コードを指定してください。" };
   if (!canSkip()) return { ok: false, code: "SKIP_NOT_ALLOWED", title: "SKIPできません", message: "SPDラベル受付後の商品バーコード待ち状態でのみSKIPできます。" };
   state.mode = "employee"; saveState();
   return { ok: true, code: "SKIP_APPROVER_REQUIRED", title: "SKIP承認者コード待ち", message: "承認した作業リーダーの名札バーコードを読み取ってください。", pending: state.pendingSpdLabel };
 }
-function executeSkip(approverCode, effects = {}) {
+async function executeSkip(approverCode, effects = {}) {
+  if (state.historySaveError || state.historySaving) return historyStorageBlockResult();
   const employeeCode = normalizeWorkerCode(approverCode);
   if (!employeeCode) return { ok: false, code: "WORKER_CODE_REQUIRED", title: "承認者コード未入力", message: "SKIPを承認した作業リーダーの作業者コードを入力または読み取ってください。" };
   if (!canConfirmSkip()) return { ok: false, code: "SKIP_NOT_ALLOWED", title: "SKIPできません", message: "SKIP承認者コード待ち状態でのみ確定できます。" };
   const beforeCounts = getTargetCounts(), pending = state.pendingSpdLabel, product = pending.lastProductAttempt || null;
   const skipReason = normalizeValue(pending.row["JANコード"]) ? "作業者SKIP" : "マスターJANなし";
-  state.readLabelKeys.add(pending.labelKey); state.processedResults.set(pending.labelKey, "SKIP");
   const detail = skipReason === "マスターJANなし" ? "マスターJANなし・リーダー承認済み" : "作業リーダー承認SKIP";
   const record = createHistoryRecord({ result: "SKIP", detail, pending, product, skipReason, employeeCode, completedAt: new Date().toISOString() });
-  state.pendingSpdLabel = null; state.mode = "spd"; saveState(); void saveScanHistory(record);
+  try { await saveScanHistory(record); } catch { return historyStorageBlockResult(); }
+  state.readLabelKeys.add(pending.labelKey); state.processedResults.set(pending.labelKey, "SKIP");
+  state.pendingSpdLabel = null; state.mode = "spd"; saveState();
   const afterCounts = getTargetCounts(), completed = didCompleteTarget(beforeCounts, afterCounts);
   if (completed) (effects.playCompletion || playCompletionSound)();
   else (effects.playProductSuccess || playProductSuccessSound)();
@@ -613,7 +657,7 @@ function getMasterFacilitySettings(rows) {
 }
 function saveState() {
   try {
-    localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ readLabelKeys: [...state.readLabelKeys], processedResults: [...state.processedResults.entries()], targetStartDate: state.targetStartDate, targetEndDate: state.targetEndDate, currentDepartment: state.currentDepartment, workerCode: state.workerCode, masterFingerprint: state.masterInfo?.fingerprint || null }));
+    localStorage.setItem(STORAGE_KEYS.state, JSON.stringify({ readLabelKeys: [...state.readLabelKeys], processedResults: [...state.processedResults.entries()], targetStartDate: state.targetStartDate, targetEndDate: state.targetEndDate, currentDepartment: state.currentDepartment, workerCode: state.workerCode, workSessionId: state.workSessionId, masterFingerprint: state.masterInfo?.fingerprint || null }));
     return true;
   } catch (error) { console.error("作業状態の保存に失敗しました。", error); showImportMessage("ブラウザに作業状態を保存できませんでした。空き容量やSafariの設定を確認してください。", true); return false; }
 }
@@ -636,11 +680,12 @@ function restoreState() {
         state.processedResults = new Map(Array.isArray(saved.processedResults) ? saved.processedResults : [...state.readLabelKeys].map((key) => [key, "OK"]));
         state.currentDepartment = saved.currentDepartment || null; reconcileCurrentDepartment();
         state.workerCode = normalizeWorkerCode(saved.workerCode);
+        state.workSessionId = saved.workSessionId || createHistoryId();
       }
     }
   } catch (error) { console.error("保存済み作業状態を読み込めません。", error); localStorage.removeItem(STORAGE_KEYS.state); }
   // pendingは再起動後に別商品へ引き継がないよう、意図的に保存・復元しない。
-  state.pendingSpdLabel = null; state.mode = state.currentDepartment ? "spd" : "container"; if (state.masterInfo) saveState();
+  state.pendingSpdLabel = null; state.mode = state.currentDepartment ? "spd" : "container"; if (state.masterInfo) { state.workSessionId ||= createHistoryId(); saveState(); }
 }
 async function decodeMasterFile(file) { const buffer = await file.arrayBuffer(); try { return new TextDecoder("shift-jis", { fatal: true }).decode(buffer); } catch { throw new Error("TSVをCP932（Shift-JIS系）として読み込めませんでした。文字コードを確認してください。"); } }
 async function loadMasterFile(file) {
@@ -656,10 +701,12 @@ function applyMasterData(rows, info) {
   saveMaster(rows, validatedInfo); state.masterRows = rows; state.masterInfo = validatedInfo; rebuildIndexes();
   state.readLabelKeys = new Set(); state.processedResults = new Map(); state.currentDepartment = null; state.workerCode = ""; state.pendingSpdLabel = null; state.mode = "container";
   state.targetStartDate = today; state.targetEndDate = today;
+  state.workSessionId = createHistoryId(); state.backupPreparation = true;
   saveState();
 }
 function createFingerprint(file, rows) { return `${file.name}:${file.size}:${file.lastModified}:${rows.length}:${rows[0]?.["ラベルキー"] || ""}:${rows.at(-1)?.["ラベルキー"] || ""}`; }
 async function importMaster(file) {
+  if (state.historySaving || state.historySaveError) { showImportMessage("履歴保存が完了していないため、マスター再取込はできません。履歴保存を再試行してください。", true); return; }
   if (!file) return; showImportMessage("TSVを読み込み、内容を検証しています…", false);
   try { const data = await loadMasterFile(file); applyMasterData(data.rows, data.info); showImportMessage(`${data.rows.length}件を取り込みました。以前の作業状態はリセットしました。`, false, true); renderAll(); showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); }
   catch (error) { console.error("TSV取込エラー", error); showImportMessage(`取込を中止しました。現在のマスターは変更していません。\n${error.message}`, true); playAlertSound(); }
@@ -699,11 +746,11 @@ async function processScan(rawValue) {
   } else if (!hasWorkerCode()) {
     showResult("ng", "作業者未指定", "作業者コードを指定してください。", []); playAlertSound(); openWorkerCodeDialog(true, "worker");
   } else if (state.mode === "employee") {
-    const result = executeSkip(value); renderAll();
+    const result = await executeSkip(value); renderAll();
     if (result.ok) showResult("skip", result.title, result.message, [["製品番号", result.record.productNumber], ["品名", result.record.productName], ["承認者コード", result.record.employeeCode], ["通常作業者", state.workerCode], ["SKIP理由", result.record.skipReason], ["ラベルキー", result.record.labelKey]]);
     else { showResult("ng", result.title, result.message, []); playAlertSound(); }
   } else if (state.mode === "spd") {
-    if (!/^\d{32}$/.test(value)) { const result = { code: "SCAN_ORDER", title: "読取順序エラー", message: "SPDラベルを先に読み取ってください。" }; void saveNgHistory(result); showResult("ng", result.title, result.message, []); playAlertSound(); }
+    if (!/^\d{32}$/.test(value)) { const result = { code: "SCAN_ORDER", title: "読取順序エラー", message: "SPDラベルを先に読み取ってください。" }; try { await saveNgHistory(result); } catch { return historyStorageBlockResult(); } showResult("ng", result.title, result.message, []); playAlertSound(); }
     else {
       const result = validateSpdLabel(value);
       if (result.ok) {
@@ -711,20 +758,21 @@ async function processScan(rawValue) {
         renderAll();
         const noJan = !normalizeValue(result.row["JANコード"]) && !getAlternateJans(result.row).length;
         showResult("pending", noJan ? "JAN未登録商品" : "商品バーコード待ち", noJan ? "ラベルマスタにJANが登録されていません。SKIPで確認してください。" : result.message, [["製品番号", getProductNumber(result.row)], ["品名", result.row["品名"]], ["JAN", result.row["JANコード"] || "なし"], ["ラベルキー", result.labelKey]]);
-      } else { void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound(); }
+      } else { try { await saveNgHistory(result); } catch { return historyStorageBlockResult(); } showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound(); }
     }
   } else if (detectProductBarcodeType(value) === "UNKNOWN" && (/^\d{20}$/.test(value) || /^\d{32}$/.test(value))) {
     // 商品として認識される32桁GS1は商品照合へ進め、オリコン・SPD系入力だけを順序エラーにする。
     const result = { code: "SCAN_ORDER", title: "読取順序エラー", message: "現在の商品照合を完了するか、SPDラベル読取を取消してください。", pending: state.pendingSpdLabel };
-    void saveNgHistory(result); showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound();
+    try { await saveNgHistory(result); } catch { return historyStorageBlockResult(); } showResult("ng", result.title, result.message, getResultDetails(result)); playAlertSound();
   } else {
-    const result = processProductScanValue(value); renderAll();
+    const result = await processProductScanValue(value); renderAll();
     if (result.code === "SKIP_APPROVER_REQUIRED") { showResult("pending", result.title, result.message, [["通常作業者", state.workerCode], ["製品番号", getProductNumber(result.pending.row)], ["品名", result.pending.row["品名"]], ["ラベルキー", result.pending.labelKey]]); openWorkerCodeDialog(true, "skip"); }
     else showResult(result.ok ? "ok" : "ng", result.ok ? "OK" : result.title, result.message, getResultDetails(result));
   }
 }
-function handleClearDepartment() { clearContainerDepartment(); renderAll(); showResult("idle", "オリコン指定解除", "作業者コードも解除しました。20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); }
+function handleClearDepartment() { if (state.historySaving || state.historySaveError) return; clearContainerDepartment(); renderAll(); showResult("idle", "オリコン指定解除", "作業者コードも解除しました。20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); }
 function handleCancelPending() {
+  if (state.historySaving || state.historySaveError) return;
   if (state.mode === "employee") {
     if (cancelSkipProcess()) { closeWorkerCodeDialog(); renderAll(); showResult("pending", "SKIP取消", "商品バーコード待ちへ戻りました。", []); }
   } else if (cancelPendingSpdLabel()) { renderAll(); showResult("idle", "キャンセル", "SPDラベル待ちへ戻りました。", []); }
@@ -762,7 +810,7 @@ function renderPendingPanel() {
   const noJan = !normalizeValue(pending.row["JANコード"]) && !getAlternateJans(pending.row).length;
   elements.pendingProductNumber.textContent = getProductNumber(pending.row); elements.pendingProductName.textContent = pending.row["品名"];
   elements.pendingInstruction.textContent = state.mode === "employee" ? "SKIPを承認する作業リーダーのコードを入力してください" : noJan ? "SKIPボタンまたはSPD-SKIPを読み取ってください" : "商品JAN / GS1-128を読み取ってください";
-  elements.skipButton.disabled = !canSkip() || !isShippingBackupReady();
+  elements.skipButton.disabled = !canSkip() || !canContinueCurrentShippingWork();
   elements.cancelPendingButton.textContent = state.mode === "employee" ? "SKIP取消" : "キャンセル";
 }
 function renderWorker() { elements.currentWorkerCode.textContent = hasWorkerCode() ? `作業者：${state.workerCode}` : "作業者：未指定"; elements.changeWorkerButton.disabled = !state.currentDepartment || state.mode === "employee" || !isShippingBackupReady(); }
@@ -974,13 +1022,46 @@ async function shareHistoryCsv(records = filterHistory(state.history, getHistory
 }
 
 function isHistoryBackupSupported(windowRef = globalThis) { return typeof windowRef?.showDirectoryPicker === "function"; }
-function isShippingBackupReady(windowRef = globalThis) { return !isHistoryBackupSupported(windowRef) || state.backupStatus === "ready"; }
-function getShippingBackupBlockResult(windowRef = globalThis) {
-  if (isShippingBackupReady(windowRef)) return null;
-  if (state.backupStatus === "checking") return { ok: false, code: "BACKUP_REQUIRED", title: "バックアップ確認中", message: "履歴バックアップ先の確認が終わるまでお待ちください。" };
-  if (state.backupStatus === "permission") return { ok: false, code: "BACKUP_REQUIRED", title: "バックアップ再許可が必要", message: "出荷チェックを開始するには、保存先フォルダへのアクセスを許可してください。" };
-  if (state.backupStatus === "error") return { ok: false, code: "BACKUP_REQUIRED", title: "バックアップを確認してください", message: "履歴バックアップ先を利用できません。保存先を再設定してください。" };
-  return { ok: false, code: "BACKUP_REQUIRED", title: "バックアップ設定が必要", message: "出荷チェックを開始するには、履歴バックアップ先を設定してください。" };
+function isShippingBackupReady() { return !state.historySaveError && !state.historySaving && !state.backupSetupBusy; }
+function isShippingWorkInProgress() {
+  return Boolean(state.pendingSpdLabel) && ["product", "employee"].includes(state.mode);
+}
+function canContinueCurrentShippingWork(windowRef = globalThis) {
+  return isShippingBackupReady(windowRef);
+}
+function historyStorageBlockResult() {
+  return { ok: false, completed: false, code: state.historySaveError ? "HISTORY_SAVE_FAILED" : "HISTORY_SAVING",
+    title: state.historySaveError ? "履歴保存失敗・作業停止" : "履歴保存中",
+    message: state.historySaveError ? "ブラウザ内履歴を保存できません。読取状態は保持しています。履歴保存を再試行してください。" : "履歴保存が完了するまで次の読取をお待ちください。" };
+}
+function getShippingBackupBlockResult() {
+  if (state.initializing) return { ok: false, code: "INITIALIZING", title: "内部履歴確認中", message: "起動処理が終わるまでお待ちください。" };
+  if (state.backupSetupBusy) return { ok: false, code: "BACKUP_SETTING", title: "バックアップ設定中", message: "設定操作が終わるまでお待ちください。" };
+  return isShippingBackupReady() ? null : historyStorageBlockResult();
+}
+function isBackupPreparationSafe() {
+  return state.backupPreparation && !state.currentDepartment && !state.workerCode && !state.pendingSpdLabel
+    && state.mode === "container" && !state.scannerBuffer && !state.historySaving && !state.historySaveError;
+}
+async function retryFailedHistorySave() {
+  const record = state.failedHistoryRecord;
+  if (state.historySaving) return false;
+  if (!record) {
+    state.historySaving = true; state.historySaveError = "";
+    try { await loadScanHistory(); if (!state.historySaveError) { renderAll(); showResult("ok", "内部履歴を確認しました", "出荷チェックを再開できます。", []); } return !state.historySaveError; }
+    finally { state.historySaving = false; renderShippingBackupGate(); if (state.historySaveError) showResult("ng", "内部履歴確認失敗・作業停止", state.historySaveError, []); }
+  }
+  try {
+    await saveScanHistory(record);
+    state.historySaveError = ""; state.failedHistoryRecord = null;
+    if (["OK", "SKIP"].includes(record.result)) {
+      state.readLabelKeys.add(record.labelKey); state.processedResults.set(record.labelKey, record.result);
+      state.pendingSpdLabel = null; state.mode = "spd"; saveState();
+      if (elements.workerCodeDialog && !elements.workerCodeDialog.hidden) closeWorkerCodeDialog();
+    }
+    renderAll(); showResult("ok", "履歴を保存しました", "内部保存を確認しました。出荷チェックを再開できます。", []);
+    return true;
+  } catch { return false; }
 }
 function historyBackupFileName(record) {
   const date = new Date(record.eventAt || record.completedAt || Date.now());
@@ -996,8 +1077,9 @@ function backupTextContainsHistoryId(text, historyId) {
 }
 function setBackupStatus(status, message) {
   state.backupStatus = status;
+  state.backupReason = message;
   if (elements.historyBackupStatus) {
-    elements.historyBackupStatus.textContent = `履歴バックアップ：${message}`;
+    elements.historyBackupStatus.textContent = `${status === "ready" && !pendingHistoryBackupIds.size ? "バックアップ正常" : "バックアップ保留：" + pendingHistoryBackupIds.size + "件"}　${message}`;
     elements.historyBackupStatus.className = `backup-status${status === "ready" ? " is-ok" : ["error", "unset", "permission"].includes(status) ? " is-warning" : ""}`;
   }
   renderShippingBackupGate();
@@ -1005,51 +1087,66 @@ function setBackupStatus(status, message) {
 }
 function renderShippingBackupGate() {
   if (!elements.shippingBackupGate) return;
-  const supported = isHistoryBackupSupported(), status = state.backupStatus;
-  let title = "履歴バックアップ：確認中", message = "保存先の状態を確認しています。", button = "バックアップ先を設定";
-  if (!supported || status === "unsupported") { title = "履歴バックアップ：非対応端末"; message = "この端末ではPCローカル履歴バックアップは利用できません。ブラウザ内履歴で出荷チェックを利用できます。"; }
-  else if (status === "ready") { title = "履歴バックアップ：正常"; message = `保存先を確認しました（${state.backupDirectoryHandle?.name || "設定フォルダ"}）。`; }
-  else if (status === "permission") { title = "履歴バックアップ：再許可が必要"; message = "出荷チェックを開始するには、保存先へのアクセスを許可してください。"; button = "アクセスを許可"; }
-  else if (status === "error") { title = "履歴バックアップ：利用できません"; message = "保存先を確認できません。再設定してください。"; button = "バックアップ先を再設定"; }
-  else if (status === "unset") { title = "履歴バックアップ：未設定"; message = "出荷チェックを開始するには、バックアップ先を設定してください。推奨：C:\\システム\\SPD出荷チェッカー\\読取履歴データ"; }
+  const supported = isHistoryBackupSupported(), status = state.backupStatus, safe = isBackupPreparationSafe();
+  let title = !supported ? "履歴はブラウザ内に保存" : status === "ready" && !pendingHistoryBackupIds.size ? "バックアップ正常" : `バックアップ保留：${pendingHistoryBackupIds.size}件`;
+  let message = state.backupReason || "内部履歴を保存して作業を継続できます。";
+  if (safe && supported && status !== "ready") message += state.backupDirectoryHandle ? " 作業前にアクセスを許可できます。" : " 管理者に保存先登録を依頼してください。";
   elements.shippingBackupGateTitle.textContent = title; elements.shippingBackupGateMessage.textContent = message;
-  elements.shippingBackupGate.className = `card shipping-backup-gate${status === "ready" ? " is-ready" : !supported || status === "unsupported" ? " is-unsupported" : ""}`;
-  elements.shippingBackupSetupButton.hidden = !supported || status === "ready"; elements.shippingBackupSetupButton.disabled = status === "checking"; elements.shippingBackupSetupButton.textContent = button;
-  if (elements.configureHistoryBackupButton) elements.configureHistoryBackupButton.textContent = status === "permission" ? "履歴バックアップを再許可" : status === "ready" ? "履歴バックアップ先を変更" : "履歴バックアップ先設定";
+  elements.shippingBackupGate.className = `card shipping-backup-gate${safe ? "" : " is-compact"}${status === "ready" ? " is-ready" : !supported ? " is-unsupported" : ""}`;
+  elements.shippingBackupSetupButton.hidden = !supported || !safe || state.backupDirectoryHandle?.name !== "読取履歴" || !["permission", "error"].includes(status);
+  elements.shippingBackupSetupButton.disabled = !safe; elements.shippingBackupSetupButton.textContent = "アクセスを許可";
+  if (elements.configureHistoryBackupButton) {
+    elements.configureHistoryBackupButton.textContent = "バックアップ先登録・再設定（管理者）";
+    elements.configureHistoryBackupButton.disabled = !supported || !safe;
+  }
+  if (elements.retryHistorySaveButton) { elements.retryHistorySaveButton.hidden = !state.historySaveError; elements.retryHistorySaveButton.disabled = state.historySaving; }
+  if (elements.historyBackupStatus) elements.historyBackupStatus.textContent = !supported ? "この端末ではローカル履歴バックアップを利用できません。" : `${title}　${state.backupReason}`;
 }
 async function restoreHistoryBackup() {
   if (!isHistoryBackupSupported()) { state.backupDirectoryHandle = null; setBackupStatus("unsupported", "この端末では利用できません"); return; }
   try {
     state.backupDirectoryHandle = await getHistorySetting(BACKUP_DIRECTORY_KEY);
     if (!state.backupDirectoryHandle) { setBackupStatus("unset", "保存先未設定"); return; }
+    if (state.backupDirectoryHandle.name !== "読取履歴") { setBackupStatus("registration", "指定先の登録が必要です。作業準備中に管理者へ依頼してください。"); return; }
     const permission = await state.backupDirectoryHandle.queryPermission({ mode: "readwrite" });
     setBackupStatus(permission === "granted" ? "ready" : "permission", permission === "granted" ? `設定済み（${state.backupDirectoryHandle.name}）` : "再度アクセス許可が必要です");
   } catch (error) { console.error("履歴バックアップ設定を読み込めません。", error); state.backupDirectoryHandle = null; setBackupStatus("error", "保存先設定を読み込めません"); }
 }
 async function configureHistoryBackup(windowRef = globalThis, { reuseExisting = false } = {}) {
   if (!isHistoryBackupSupported(windowRef)) { setBackupStatus("unsupported", "この端末ではローカル履歴バックアップ機能は利用できません"); return { ok: false, code: "UNSUPPORTED" }; }
+  // フォルダ選択で照合作業を中断させない。現在の1件が完了してから利用者操作で再設定する。
+  if (!isBackupPreparationSafe()) return { ok: false, code: "WORK_IN_PROGRESS", message: "ラベルマスタ取込後の作業準備中に設定してください。" };
+  if (!reuseExisting && !backupAdminAuthorized) return { ok: false, code: "ADMIN_REQUIRED" };
+  state.backupSetupBusy = true;
   try {
     // 保存先設定・変更では必ず選び直し、再許可の場合だけ既存ハンドルを使う。
     let handle = reuseExisting ? state.backupDirectoryHandle : null;
+    if (reuseExisting && (!handle || handle.name !== "読取履歴")) return { ok: false, code: "ADMIN_REQUIRED" };
     if (handle) {
       const permission = await handle.requestPermission({ mode: "readwrite" });
-      if (permission !== "granted") handle = null;
+      if (permission !== "granted") { setBackupStatus("permission", "アクセス許可が必要です"); return { ok: false, code: "PERMISSION_REQUIRED" }; }
     }
-    if (!handle) handle = await windowRef.showDirectoryPicker({ mode: "readwrite", id: "spd-history-backup" });
+    if (!handle) { backupAdminAuthorized = false; handle = await windowRef.showDirectoryPicker({ mode: "readwrite", id: "spd-history-backup" }); }
+    if (!reuseExisting && handle.name !== "読取履歴") throw new Error(`指定先 ${BACKUP_PATH} の「読取履歴」フォルダを選択してください。`);
     let permission = await handle.queryPermission({ mode: "readwrite" });
     if (permission !== "granted") permission = await handle.requestPermission({ mode: "readwrite" });
     if (permission !== "granted") throw new Error("選択したフォルダへの書込み権限を確認できません。");
     await setHistorySetting(BACKUP_DIRECTORY_KEY, handle); state.backupDirectoryHandle = handle;
-    setBackupStatus("ready", `設定済み（${handle.name}）`);
-    return { ok: true, handle };
+    const retried = await flushPendingHistoryBackups(handle);
+    setBackupStatus("ready", `設定済み（${handle.name}）${retried ? `・保留${retried}件を保存` : ""}`);
+    return { ok: true, handle, retried };
   } catch (error) {
     if (error?.name === "AbortError") return { ok: false, code: "CANCELLED" };
     console.error("履歴バックアップ先を設定できません。", error); setBackupStatus("error", "保存先設定に失敗しました"); return { ok: false, code: "SETUP_FAILED", error };
+  } finally {
+    backupAdminAuthorized = false; state.backupSetupBusy = false; renderShippingBackupGate();
+    if (elements.modeStatus) { renderMode(); renderPendingPanel(); renderWorker(); }
   }
 }
 async function writeHistoryBackupRecord(record, handle = state.backupDirectoryHandle) {
   if (!isHistoryBackupSupported()) return { ok: false, code: "UNSUPPORTED" };
   if (!handle) return { ok: false, code: "NOT_CONFIGURED" };
+  if (handle.name && handle.name !== "読取履歴") return { ok: false, code: "WRONG_DIRECTORY" };
   const permission = await handle.queryPermission({ mode: "readwrite" });
   if (permission !== "granted") return { ok: false, code: "PERMISSION_REQUIRED" };
   const fileHandle = await handle.getFileHandle(historyBackupFileName(record), { create: true });
@@ -1062,15 +1159,45 @@ async function writeHistoryBackupRecord(record, handle = state.backupDirectoryHa
   const separator = existingFile.size && !/\r?\n$/.test(existingText) ? "\r\n" : "";
   const content = existingFile.size ? `${separator}${historyBackupRow(record, columns)}\r\n` : `\uFEFF${historyBackupHeader(columns)}\r\n${historyBackupRow(record, columns)}\r\n`;
   const writable = await fileHandle.createWritable({ keepExistingData: true });
-  try { await writable.seek(existingFile.size); await writable.write(content); } finally { await writable.close(); }
+  try { await writable.seek(existingFile.size); await writable.write(content); await writable.close(); }
+  catch (error) { try { await writable.abort?.(); } catch {} throw error; }
   return { ok: true, code: "SAVED", fileName: fileHandle.name };
+}
+async function flushPendingHistoryBackups(handle = state.backupDirectoryHandle) {
+  const flushing = backupWriteQueue.then(async () => {
+    const recordsById = new Map(state.history.map((record) => [normalizeValue(record.historyId), record]));
+    let savedCount = 0;
+    for (const historyId of [...pendingHistoryBackupIds]) {
+      const record = recordsById.get(historyId);
+      if (!record) throw new Error("保留履歴に対応する内部履歴が見つかりません。管理者へ連絡してください。");
+      const result = await writeHistoryBackupRecord(record, handle);
+      if (!result.ok) throw new Error(result.code === "PERMISSION_REQUIRED" ? "保留履歴の保存にアクセス許可が必要です。" : "保留履歴をバックアップできません。");
+      await acknowledgeHistoryBackup(historyId); savedCount += 1;
+    }
+    return savedCount;
+  });
+  backupWriteQueue = flushing.catch(() => {});
+  return flushing;
+}
+async function acknowledgeHistoryBackup(historyId) {
+  const acknowledge = historyPersistenceQueue.then(async () => {
+    const remaining = [...pendingHistoryBackupIds].filter((id) => id !== historyId);
+    await setHistorySetting(PENDING_BACKUP_IDS_KEY, remaining);
+    pendingHistoryBackupIds.delete(historyId); renderShippingBackupGate();
+  });
+  historyPersistenceQueue = acknowledge.catch(() => {});
+  return acknowledge;
 }
 function enqueueHistoryBackup(record) {
   backupWriteQueue = backupWriteQueue.then(async () => {
     const result = await writeHistoryBackupRecord(record);
-    if (result.ok) setBackupStatus("ready", `保存済み（${result.fileName || state.backupDirectoryHandle?.name || "設定フォルダ"}）`);
+    if (result.ok) {
+      if (pendingHistoryBackupIds.has(record.historyId)) await acknowledgeHistoryBackup(record.historyId);
+      setBackupStatus("ready", `保存済み（${result.fileName || state.backupDirectoryHandle?.name || "設定フォルダ"}）`);
+    }
     else if (result.code === "NOT_CONFIGURED") setBackupStatus("unset", "保存先未設定（ブラウザ内には保存済み）");
-    else if (result.code === "PERMISSION_REQUIRED") setBackupStatus("error", "アクセス許可が必要です（ブラウザ内には保存済み）");
+    else if (result.code === "WRONG_DIRECTORY") setBackupStatus("registration", "指定先の登録が必要です（ブラウザ内には保存済み）");
+    else if (result.code === "PERMISSION_REQUIRED") setBackupStatus("permission", "アクセス許可が必要です（ブラウザ内には保存済み）");
   }).catch((error) => { console.error("履歴バックアップに失敗しました。", error); setBackupStatus("error", "書き込みに失敗しました（ブラウザ内には保存済み）"); });
   return backupWriteQueue;
 }
@@ -1190,7 +1317,7 @@ function closeSkipBarcodePreview() {
 }
 function printSkipBarcode(windowRef = window) { windowRef.print(); }
 function openWorkerCodeDialog(required = !hasWorkerCode(), purpose = "worker") {
-  const backupBlock = getShippingBackupBlockResult();
+  const backupBlock = getShippingBackupBlockResult(globalThis, { allowActiveWork: purpose === "skip" });
   if (backupBlock) { showResult("ng", backupBlock.title, backupBlock.message, []); return false; }
   if (!state.masterInfo) { showResult("ng", "マスター未読込", "先にラベルマスタ.tsvを読み込んでください。", []); return false; }
   if (!state.currentDepartment) { showResult("ng", "部署未指定", "先にオリコンラベルまたは部署検索で部署を指定してください。", []); return false; }
@@ -1214,17 +1341,24 @@ function closeWorkerCodeDialog() {
   elements.workerCodeDialog.hidden = true; document.body.classList.remove("worker-code-dialog-open");
   if (workerDialogReturnFocus?.focus) workerDialogReturnFocus.focus(); workerDialogReturnFocus = null;
 }
-function confirmWorkerCode() {
+async function confirmWorkerCode() {
+  if (workerConfirmBusy) return { ok: false, code: "SAVING" };
+  workerConfirmBusy = true;
+  try {
   if (elements.workerCodeDialog.hidden) return { ok: false };
-  const backupBlock = getShippingBackupBlockResult();
-  if (backupBlock) { elements.workerCodeError.textContent = backupBlock.message; return backupBlock; }
   const purpose = elements.workerCodeDialog.dataset.purpose || "worker";
-  const result = confirmWorkerCodeValue(elements.workerCodeInput.value, purpose);
-  if (!result.ok) { elements.workerCodeError.textContent = result.message; elements.workerCodeInput.focus(); return result; }
+  const backupBlock = getShippingBackupBlockResult(globalThis, { allowActiveWork: purpose === "skip" });
+  if (backupBlock) { elements.workerCodeError.textContent = backupBlock.message; return backupBlock; }
+  const result = await confirmWorkerCodeValue(elements.workerCodeInput.value, purpose);
+  if (!result.ok) {
+    if (result.code === "HISTORY_SAVE_FAILED") { closeWorkerCodeDialog(); showResult("ng", result.title, result.message, []); return result; }
+    elements.workerCodeError.textContent = result.message; elements.workerCodeInput.focus(); return result;
+  }
   closeWorkerCodeDialog(); renderAll();
   if (purpose === "skip") showResult("skip", result.title, result.message, [["製品番号", result.record.productNumber], ["品名", result.record.productName], ["承認者コード", result.record.employeeCode], ["通常作業者", state.workerCode], ["SKIP理由", result.record.skipReason], ["ラベルキー", result.record.labelKey]]);
   else showResult("ok", "作業者指定 OK", `作業者：${result.workerCode}`, [["次の操作", "SPDラベルQRを読み取ってください。"]]);
   return result;
+  } finally { workerConfirmBusy = false; }
 }
 function confirmWorkerCodeValue(value, purpose = "worker", effects = {}) {
   if (purpose === "skip") return executeSkip(value, effects);
@@ -1233,6 +1367,7 @@ function confirmWorkerCodeValue(value, purpose = "worker", effects = {}) {
   return result;
 }
 function cancelWorkerCodeDialog() {
+  if (state.historySaving || state.historySaveError) return false;
   const purpose = elements.workerCodeDialog.dataset.purpose || "worker";
   if (purpose === "skip") { cancelSkipProcess(); closeWorkerCodeDialog(); renderAll(); showResult("pending", "SKIP取消", "商品バーコード待ちへ戻りました。", []); return true; }
   if (elements.workerCodeDialog.dataset.required === "true" || !hasWorkerCode()) { clearContainerDepartment(); closeWorkerCodeDialog(); renderAll(); showResult("idle", "作業者指定取消", "部署指定へ戻りました。20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); return true; }
@@ -1284,12 +1419,26 @@ function selectDepartmentFromSearch(department) {
 }
 
 async function handleConfigureHistoryBackup() {
-  const result = await configureHistoryBackup(globalThis, { reuseExisting: state.backupStatus === "permission" });
-  renderAll();
-  if (result.ok) {
-    elements.historyMessage.textContent = "履歴バックアップ先を確認しました。出荷チェックを利用できます。";
-    showResult("ok", "履歴バックアップ先を確認しました", `保存先：${result.handle.name}`, []);
+  if (!isBackupPreparationSafe()) {
+    const result = { ok: false, code: "WORK_IN_PROGRESS", message: "現在の照合作業を完了してからバックアップ先を設定してください。" };
+    elements.historyMessage.textContent = result.message;
+    renderShippingBackupGate();
+    return result;
   }
+  return openAdminPasswordDialog("backup");
+}
+async function handleReauthorizeHistoryBackup() {
+  const result = await configureHistoryBackup(globalThis, { reuseExisting: true });
+  if (result.ok) {
+    elements.historyMessage.textContent = `バックアップ先へのアクセスを確認しました。保留${result.retried}件を保存しました。`;
+  }
+  return result;
+}
+async function handleAdminBackupSelection() {
+  if (!backupAdminAuthorized || !isBackupPreparationSafe()) return { ok: false, code: "ADMIN_REQUIRED" };
+  const result = await configureHistoryBackup();
+  if (result.ok) { closeAdminPasswordDialog(); elements.historyMessage.textContent = "バックアップ先を登録しました。"; }
+  else elements.adminPasswordError.textContent = result.error?.message || "登録を完了できませんでした。再度管理者認証してください。";
   return result;
 }
 function openHistoryRestoreDialog() {
@@ -1332,11 +1481,14 @@ async function confirmHistoryRestore() {
 }
 
 async function openAdminPasswordDialog(action = "delete") {
+  if (action === "backup" && !isBackupPreparationSafe()) return false;
+  backupAdminAuthorized = false;
   try {
     const credential = await getHistorySetting(ADMIN_PASSWORD_KEY);
     adminPasswordReturnFocus = document.activeElement; elements.adminPasswordDialog.dataset.mode = credential ? "verify" : "setup"; elements.adminPasswordDialog.dataset.action = action;
     elements.adminPasswordHeading.textContent = credential ? "管理者認証" : "管理者パスワード初期設定";
-    elements.adminPasswordHelp.textContent = credential ? action === "restore" ? "バックアップCSVから履歴を復元するには管理者パスワードを入力してください。" : "ブラウザ内の履歴を削除するには管理者パスワードを入力してください。バックアップCSVは削除されません。" : "初回のみ、履歴管理用の管理者パスワードを8文字以上で設定してください。パスワード自体は保存しません。";
+    elements.adminPasswordHelp.textContent = action === "backup" ? `バックアップ先：${BACKUP_PATH}。管理者認証後にフォルダを選択してください。完全なパスは選択画面で確認してください。` : credential ? action === "restore" ? "バックアップCSVから履歴を復元するには管理者パスワードを入力してください。" : "ブラウザ内の履歴を削除するには管理者パスワードを入力してください。バックアップCSVは削除されません。" : "初回のみ、履歴管理用の管理者パスワードを8文字以上で設定してください。パスワード自体は保存しません。";
+    elements.chooseBackupFolderButton.hidden = true; elements.confirmAdminPasswordButton.hidden = false;
     elements.adminPasswordConfirmArea.hidden = Boolean(credential); elements.adminPasswordInput.value = ""; elements.adminPasswordConfirmInput.value = ""; elements.adminPasswordError.textContent = "";
     elements.adminPasswordDialog.hidden = false; document.body.classList.add("admin-password-dialog-open"); requestAnimationFrame(() => elements.adminPasswordInput.focus());
     return true;
@@ -1346,7 +1498,7 @@ async function openAdminPasswordDialog(action = "delete") {
     return false;
   }
 }
-function closeAdminPasswordDialog() { elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
+function closeAdminPasswordDialog() { backupAdminAuthorized = false; elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
 async function confirmAdminPassword() {
   const password = elements.adminPasswordInput.value, mode = elements.adminPasswordDialog.dataset.mode, action = elements.adminPasswordDialog.dataset.action || "delete";
   try {
@@ -1354,6 +1506,12 @@ async function confirmAdminPassword() {
       if (password !== elements.adminPasswordConfirmInput.value) throw new Error("確認用パスワードが一致しません。");
       await setHistorySetting(ADMIN_PASSWORD_KEY, await createAdminPasswordCredential(password));
     } else if (!await verifyAdminPassword(password, await getHistorySetting(ADMIN_PASSWORD_KEY))) throw new Error("管理者パスワードが正しくありません。");
+    if (action === "backup") {
+      if (!isBackupPreparationSafe()) throw new Error("作業開始後は保存先を設定できません。");
+      backupAdminAuthorized = true; elements.adminPasswordInput.value = ""; elements.adminPasswordConfirmInput.value = "";
+      elements.chooseBackupFolderButton.hidden = false; elements.confirmAdminPasswordButton.hidden = true;
+      elements.chooseBackupFolderButton.focus(); return true;
+    }
     closeAdminPasswordDialog();
     if (action === "restore") { openHistoryRestoreDialog(); return true; }
     if (!confirm("ブラウザ内の読取履歴をすべて削除します。ローカルのバックアップCSVは削除されません。実行しますか？")) return false;
@@ -1361,12 +1519,13 @@ async function confirmAdminPassword() {
   } catch (error) { elements.adminPasswordError.textContent = error.message || "管理者認証に失敗しました。"; elements.adminPasswordInput.focus(); return false; }
 }
 function cacheElements() {
-  ["masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
+  ["retryHistorySaveButton", "chooseBackupFolderButton", "masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
   elements.clearDepartmentButton.addEventListener("click", handleClearDepartment); elements.searchDepartmentButton.addEventListener("click", openDepartmentSearchDialog); elements.cancelPendingButton.addEventListener("click", handleCancelPending); elements.skipButton.addEventListener("click", handleSkip);
   const handlePeriodChange = () => {
+    if (state.historySaving || state.historySaveError) { elements.targetStartDate.value = state.targetStartDate; elements.targetEndDate.value = state.targetEndDate; return; }
     state.targetStartDate = elements.targetStartDate.value; state.targetEndDate = elements.targetEndDate.value;
     if (state.pendingSpdLabel && (!validateTargetPeriod().ok || !isRowInTargetPeriod(state.pendingSpdLabel.row))) cancelPendingSpdLabel();
     saveState(); renderMode(); renderPendingPanel(); renderCounts(); renderUnreadList();
@@ -1378,7 +1537,7 @@ function bindEvents() {
   elements.departmentSearchInput.addEventListener("input", renderDepartmentSearchList); elements.closeDepartmentSearchButton.addEventListener("click", closeDepartmentSearchDialog);
   [elements.historyStartDate, elements.historyEndDate, elements.historyFacility, elements.historyDepartment, elements.historyResult].forEach((input) => input.addEventListener("change", renderHistory)); elements.historySearch.addEventListener("input", renderHistory);
   elements.shareHistoryButton.addEventListener("click", async () => { try { const method = await shareHistoryCsv(); elements.historyMessage.textContent = method === "shared" ? "共有画面を開きました。メールアプリを選択できます。" : "共有非対応のためCSVをダウンロードしました。"; } catch (error) { if (error.name !== "AbortError") elements.historyMessage.textContent = error.message; } });
-  elements.configureHistoryBackupButton.addEventListener("click", handleConfigureHistoryBackup); elements.shippingBackupSetupButton.addEventListener("click", handleConfigureHistoryBackup);
+  elements.configureHistoryBackupButton.addEventListener("click", handleConfigureHistoryBackup); elements.shippingBackupSetupButton.addEventListener("click", handleReauthorizeHistoryBackup); elements.chooseBackupFolderButton.addEventListener("click", handleAdminBackupSelection); elements.retryHistorySaveButton.addEventListener("click", retryFailedHistorySave);
   elements.restoreHistoryButton.addEventListener("click", () => openAdminPasswordDialog("restore")); elements.clearHistoryButton.addEventListener("click", () => openAdminPasswordDialog("delete")); elements.confirmAdminPasswordButton.addEventListener("click", confirmAdminPassword); elements.cancelAdminPasswordButton.addEventListener("click", closeAdminPasswordDialog); elements.adminPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter" && elements.adminPasswordConfirmArea.hidden) { event.preventDefault(); void confirmAdminPassword(); } }); elements.adminPasswordConfirmInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void confirmAdminPassword(); } });
   elements.chooseHistoryRestoreFilesButton.addEventListener("click", () => { elements.historyRestoreFiles.value = ""; pendingHistoryRestorePlan = null; elements.confirmHistoryRestoreButton.disabled = true; elements.historyRestoreFiles.click(); }); elements.historyRestoreFiles.addEventListener("change", analyzeSelectedHistoryBackups); elements.confirmHistoryRestoreButton.addEventListener("click", confirmHistoryRestore); elements.cancelHistoryRestoreButton.addEventListener("click", closeHistoryRestoreDialog);
   elements.printUnreadButton.addEventListener("click", () => { void printUnreadList(); });
@@ -1386,9 +1545,32 @@ function bindEvents() {
   elements.shareUnreadPdfButton.addEventListener("click", () => { void shareUnreadPdf(); });
   elements.enableAudioButton.addEventListener("click", unlockAudio); elements.showSkipBarcodeButton.addEventListener("click", openSkipBarcodePreview); elements.printSkipBarcodeButton.addEventListener("click", () => printSkipBarcode()); elements.closeSkipBarcodeButton.addEventListener("click", closeSkipBarcodePreview); window.addEventListener("keydown", handleGlobalKeydown);
 }
-async function init() { cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll(); await Promise.all([loadScanHistory(), restoreHistoryBackup()]); renderAll(); const backupBlock = getShippingBackupBlockResult(); if (backupBlock) showResult("ng", backupBlock.title, backupBlock.message, []); else if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []); else if (!state.currentDepartment) showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []); else if (!hasWorkerCode()) { showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true, "worker"); } else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []); document.body.dataset.appReady = "true"; }
+async function init() {
+  state.initializing = true;
+  cacheElements(); restoreState(); initAudio(); bindEvents(); renderAll();
+  await Promise.all([loadScanHistory(), restoreHistoryBackup(), loadPendingHistoryBackupIds()]);
+  // 同じ作業セッションの内部履歴から、保存直後の終了で失われた処理済状態を補う。
+  for (const record of state.history) {
+    if (state.workSessionId && record.workSessionId === state.workSessionId && ["OK", "SKIP"].includes(record.result)) {
+      state.readLabelKeys.add(record.labelKey); state.processedResults.set(record.labelKey, record.result);
+    }
+  }
+  if (state.masterInfo) saveState();
+  if (state.backupStatus === "ready" && pendingHistoryBackupIds.size) {
+    try { await flushPendingHistoryBackups(); setBackupStatus("ready", "保留履歴を保存しました"); }
+    catch (error) { setBackupStatus("error", "保留履歴を書き込めません（内部保存は維持）"); }
+  }
+  renderAll();
+  state.initializing = false;
+  if (state.historySaveError) showResult("ng", "内部履歴確認失敗・作業停止", state.historySaveError, []);
+  else if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []);
+  else if (!state.currentDepartment) showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []);
+  else if (!hasWorkerCode()) { showResult("idle", "作業者指定待ち", "作業者コードを指定してください。", []); openWorkerCodeDialog(true, "worker"); }
+  else showResult("idle", "待機中", "SPDラベルQRを読み取ってください。", []);
+  document.body.dataset.appReady = "true";
+}
 function isAppUpdateSafe() {
-  return appUpdate.ready && appUpdate.pendingOperations === 0 && !unreadPdfBusy && (!unreadPdfPreview || unreadPdfPreview.closed) && !state.pendingSpdLabel
+  return appUpdate.ready && !state.historySaveError && !state.historySaving && appUpdate.pendingOperations === 0 && !unreadPdfBusy && (!unreadPdfPreview || unreadPdfPreview.closed) && !state.pendingSpdLabel
     && !["product", "employee"].includes(state.mode) && !state.scannerBuffer
     && !["workerCodeDialog", "departmentSearchDialog", "adminPasswordDialog", "historyRestoreDialog", "skipBarcodePreview"]
       .some((id) => elements[id] && !elements[id].hidden);
@@ -1524,7 +1706,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = {
   createHistoryRecord, saveScanHistory, loadScanHistory, clearScanHistory, filterHistory, buildHistoryCsv,
   shareHistoryCsv, handleContainerDepartmentScan, applyMasterData, isValidDateKey, normalizeLabelKey,
   parseDateInput, todayInputValue, getProductNumber, getUniqueFacilityNames, getMasterFacilityName, getMasterFacilitySettings, getCode128BValues, getCode128ModuleRuns, printSkipBarcode,
-  normalizeWorkerCode, bindWorkerCodeInput, getDepartmentProgress, hasWorkerCode, setWorkerCode, confirmWorkerCodeValue, createHistoryId, historyBackupFileName, historyBackupRow, historyBackupHeader, backupTextContainsHistoryId, writeHistoryBackupRecord, isHistoryBackupSupported, isShippingBackupReady, getShippingBackupBlockResult,
+  normalizeWorkerCode, bindWorkerCodeInput, getDepartmentProgress, hasWorkerCode, setWorkerCode, confirmWorkerCodeValue, createHistoryId, historyBackupFileName, historyBackupRow, historyBackupHeader, backupTextContainsHistoryId, writeHistoryBackupRecord, isHistoryBackupSupported, isShippingBackupReady, isShippingWorkInProgress, canContinueCurrentShippingWork, getShippingBackupBlockResult, configureHistoryBackup,
   parseCsvRecords, parseHistoryBackupCsv, prepareHistoryRestore, commitHistoryRestore,
   deriveAdminPasswordHash, createAdminPasswordCredential, verifyAdminPassword, SKIP_COMMAND
 };

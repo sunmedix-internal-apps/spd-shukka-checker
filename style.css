@@ -111,6 +111,9 @@ main { width: min(100%, 900px); margin: 0 auto; padding: 14px 12px calc(28px + e
 .shipping-backup-gate.is-unsupported { border-color: var(--line); background: #eef2f5; }
 .shipping-backup-gate.is-unsupported strong, .shipping-backup-gate.is-unsupported p { color: var(--muted); }
 .shipping-backup-gate.is-ready, .shipping-backup-gate.is-unsupported { padding-block: 5px; }
+.shipping-backup-gate.is-compact { padding-block: 5px; }
+.shipping-backup-gate.is-compact p { display: none; }
+.backup-management { margin-top: 10px; }
 .shipping-backup-gate.is-ready p, .shipping-backup-gate.is-unsupported p { display: none; }
 
 .card, .department-card {
