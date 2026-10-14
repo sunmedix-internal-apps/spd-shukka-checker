@@ -10,7 +10,7 @@ const BACKUP_PATH = "C:\\システム\\SPD出荷チェッカー\\読取履歴";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261014-3";
+const APP_VERSION = "20261014-4";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -902,6 +902,7 @@ async function generateUnreadPdfOutput(action, env = globalThis) {
   unreadPdfBusy = true;
   appUpdate.pendingOperations += 1;
   renderUnreadPdfActions(env);
+  renderShippingBackupGate();
   let preview = null;
   try {
     // クリック時に期間・部署・マスター・完了集合から文字列のコピーを作る。
@@ -954,6 +955,7 @@ async function generateUnreadPdfOutput(action, env = globalThis) {
     unreadPdfBusy = false;
     appUpdate.pendingOperations -= 1;
     renderUnreadPdfActions(env);
+    renderShippingBackupGate();
   }
 }
 function printUnreadList(env = globalThis) { return generateUnreadPdfOutput("preview", env); }
@@ -996,6 +998,7 @@ function updateHistoryFilterOptions() {
   setOptions(elements.historyFacility, state.history.map((item) => item.facilityName), "すべての施設"); setOptions(elements.historyDepartment, state.history.map((item) => item.departmentName), "すべての部署");
 }
 function renderHistory() {
+  renderShippingBackupGate();
   updateHistoryFilterOptions(); const records = filterHistory(state.history, getHistoryFiltersFromUi()).sort((a, b) => (b.eventAt || "").localeCompare(a.eventAt || ""));
   elements.historyCount.textContent = `${records.length}件`; elements.historyList.replaceChildren();
   if (!records.length) { elements.historyList.append(createEmptyState("条件に該当する履歴はありません。")); return; }
@@ -1038,14 +1041,22 @@ function getShippingBackupBlockResult() {
   if (state.backupSetupBusy) return { ok: false, code: "BACKUP_SETTING", title: "バックアップ設定中", message: "設定操作が終わるまでお待ちください。" };
   return isShippingBackupReady() ? null : historyStorageBlockResult();
 }
-function isBackupPreparationSafe(ownOperations = 0) {
-  return !state.initializing && !state.backupSetupBusy && !state.pendingSpdLabel
-    && !["product", "employee"].includes(state.mode) && !state.scannerBuffer
-    && !state.historySaving && !state.historySaveError && !appUpdate.reloading
-    && appUpdate.pendingOperations <= ownOperations && !unreadPdfBusy && (!unreadPdfPreview || unreadPdfPreview.closed)
-    && !["workerCodeDialog", "departmentSearchDialog", "adminPasswordDialog", "historyRestoreDialog", "skipBarcodePreview"]
-      .some(id => elements[id] && !elements[id].hidden);
+function getBackupSettingBlockReason(ownOperations = 0) {
+  if (state.initializing) return "起動時の履歴確認中のため設定できません。";
+  if (state.backupSetupBusy) return "バックアップ設定処理中のため設定できません。";
+  if (state.historySaving) return "履歴保存処理中のため設定できません。";
+  if (state.historySaveError) return "内部履歴の保存エラーを解消してから設定してください。";
+  if (state.mode === "employee") return "SKIP承認中のため設定できません。";
+  if (state.pendingSpdLabel || state.mode === "product") return "商品照合中のため設定できません。";
+  if (state.scannerBuffer) return "バーコード入力途中のため設定できません。";
+  if (appUpdate.reloading) return "PWA更新処理中のため設定できません。";
+  if (appUpdate.pendingOperations > ownOperations) return `履歴保存・CSV書込み・復元等の処理中のため設定できません。（実行中：${appUpdate.pendingOperations - ownOperations}）`;
+  if (unreadPdfBusy || (unreadPdfPreview && !unreadPdfPreview.closed)) return "PDF出力・プレビュー中のため設定できません。";
+  const dialogs = { workerCodeDialog: "作業者コード入力", departmentSearchDialog: "部署検索", adminPasswordDialog: "管理者認証", historyRestoreDialog: "履歴復元", skipBarcodePreview: "バーコードプレビュー" };
+  for (const [id, name] of Object.entries(dialogs)) if (elements[id] && !elements[id].hidden) return `${name}画面が開いているため設定できません。`;
+  return "";
 }
+function isBackupPreparationSafe(ownOperations = 0) { return !getBackupSettingBlockReason(ownOperations); }
 async function retryFailedHistorySave() {
   const record = state.failedHistoryRecord;
   if (state.historySaving) return false;
@@ -1101,6 +1112,9 @@ function renderShippingBackupGate() {
   if (elements.configureHistoryBackupButton) {
     elements.configureHistoryBackupButton.textContent = "バックアップ先登録・再設定";
     elements.configureHistoryBackupButton.disabled = !supported || !safe;
+    const reason = !supported ? "この端末ではローカル履歴バックアップ機能は利用できません。" : getBackupSettingBlockReason();
+    elements.configureHistoryBackupButton.title = reason;
+    if (elements.backupSettingDisabledReason) elements.backupSettingDisabledReason.textContent = reason;
   }
   if (elements.retryHistorySaveButton) { elements.retryHistorySaveButton.hidden = !state.historySaveError; elements.retryHistorySaveButton.disabled = state.historySaving; }
   if (elements.historyBackupStatus) elements.historyBackupStatus.textContent = !supported ? "この端末ではローカル履歴バックアップを利用できません。" : `${title}　${state.backupReason}`;
@@ -1125,7 +1139,8 @@ function describeBackupFailure(stage, error) {
 async function configureHistoryBackup(windowRef = globalThis, { reuseExisting = false } = {}) {
   if (!isHistoryBackupSupported(windowRef)) { setBackupStatus("unsupported", "この端末ではローカル履歴バックアップ機能は利用できません"); return { ok: false, code: "UNSUPPORTED" }; }
   // ラッパー自身の1操作だけを除外し、保存・CSV書込み・入力・画面操作中は設定しない。
-  if (!isBackupPreparationSafe(1)) return { ok: false, code: "WORK_IN_PROGRESS", message: "現在の照合作業・保存・入力を完了してから設定してください。" };
+  const blockReason = getBackupSettingBlockReason(1);
+  if (blockReason) return { ok: false, code: "WORK_IN_PROGRESS", message: blockReason };
   state.backupSetupBusy = true;
   let stage = "picker";
   try {
@@ -1345,9 +1360,11 @@ function openSkipBarcodePreview() {
   barcodePreviewReturnFocus = document.activeElement;
   renderCode128Svg(elements.skipBarcodeSvg, SKIP_COMMAND);
   elements.skipBarcodePreview.hidden = false; document.body.classList.add("barcode-preview-open"); elements.printSkipBarcodeButton.focus();
+  renderShippingBackupGate();
 }
 function closeSkipBarcodePreview() {
   elements.skipBarcodePreview.hidden = true; document.body.classList.remove("barcode-preview-open");
+  renderShippingBackupGate();
   if (barcodePreviewReturnFocus?.focus) barcodePreviewReturnFocus.focus(); barcodePreviewReturnFocus = null;
 }
 function printSkipBarcode(windowRef = window) { windowRef.print(); }
@@ -1368,12 +1385,14 @@ function openWorkerCodeDialog(required = !hasWorkerCode(), purpose = "worker") {
   elements.cancelWorkerButton.textContent = purpose === "skip" ? "SKIP取消" : "キャンセル";
   elements.workerCodeDialog.dataset.required = required ? "true" : "false";
   elements.workerCodeDialog.hidden = false; document.body.classList.add("worker-code-dialog-open");
+  renderShippingBackupGate();
   elements.workerCodeInput.focus(); elements.workerCodeInput.select();
   return true;
 }
 function closeWorkerCodeDialog() {
   workerInputController?.reset();
   elements.workerCodeDialog.hidden = true; document.body.classList.remove("worker-code-dialog-open");
+  renderShippingBackupGate();
   if (workerDialogReturnFocus?.focus) workerDialogReturnFocus.focus(); workerDialogReturnFocus = null;
 }
 async function confirmWorkerCode() {
@@ -1444,9 +1463,9 @@ function openDepartmentSearchDialog() {
   if (backupBlock) { showResult("ng", backupBlock.title, backupBlock.message, []); return false; }
   if (!state.masterInfo) { showResult("ng", "マスター未読込", "先にラベルマスタ.tsvを読み込んでください。", []); return false; }
   departmentSearchReturnFocus = document.activeElement; elements.departmentSearchInput.value = ""; renderDepartmentSearchList();
-  elements.departmentSearchDialog.hidden = false; document.body.classList.add("department-search-dialog-open"); requestAnimationFrame(() => elements.departmentSearchInput.focus()); return true;
+  elements.departmentSearchDialog.hidden = false; document.body.classList.add("department-search-dialog-open"); renderShippingBackupGate(); requestAnimationFrame(() => elements.departmentSearchInput.focus()); return true;
 }
-function closeDepartmentSearchDialog() { elements.departmentSearchDialog.hidden = true; document.body.classList.remove("department-search-dialog-open"); if (departmentSearchReturnFocus?.focus) departmentSearchReturnFocus.focus(); departmentSearchReturnFocus = null; }
+function closeDepartmentSearchDialog() { elements.departmentSearchDialog.hidden = true; document.body.classList.remove("department-search-dialog-open"); renderShippingBackupGate(); if (departmentSearchReturnFocus?.focus) departmentSearchReturnFocus.focus(); departmentSearchReturnFocus = null; }
 function selectDepartmentFromSearch(department) {
   const result = selectDepartment(department);
   if (!result.ok) { closeDepartmentSearchDialog(); showResult("ng", result.title, result.message, []); playAlertSound(); return result; }
@@ -1467,10 +1486,12 @@ function openHistoryRestoreDialog() {
   historyRestoreReturnFocus = document.activeElement; pendingHistoryRestorePlan = null;
   elements.historyRestoreFiles.value = ""; elements.historyRestoreSummary.textContent = "CSVを選択してください。"; elements.historyRestoreError.textContent = ""; elements.confirmHistoryRestoreButton.disabled = true;
   elements.historyRestoreDialog.hidden = false; document.body.classList.add("history-restore-dialog-open");
+  renderShippingBackupGate();
   requestAnimationFrame(() => elements.chooseHistoryRestoreFilesButton.focus());
 }
 function closeHistoryRestoreDialog() {
   elements.historyRestoreDialog.hidden = true; document.body.classList.remove("history-restore-dialog-open"); pendingHistoryRestorePlan = null;
+  renderShippingBackupGate();
   if (historyRestoreReturnFocus?.focus) historyRestoreReturnFocus.focus(); historyRestoreReturnFocus = null;
 }
 async function analyzeSelectedHistoryBackups() {
@@ -1517,7 +1538,7 @@ async function openAdminPasswordDialog(action = "delete") {
     return false;
   }
 }
-function closeAdminPasswordDialog() { elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
+function closeAdminPasswordDialog() { elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); renderShippingBackupGate(); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
 async function confirmAdminPassword() {
   const password = elements.adminPasswordInput.value, mode = elements.adminPasswordDialog.dataset.mode, action = elements.adminPasswordDialog.dataset.action || "delete";
   try {
@@ -1532,6 +1553,7 @@ async function confirmAdminPassword() {
   } catch (error) { elements.adminPasswordError.textContent = error.message || "管理者認証に失敗しました。"; elements.adminPasswordInput.focus(); return false; }
 }
 function cacheElements() {
+  elements.backupSettingDisabledReason = document.getElementById("backupSettingDisabledReason");
   ["retryHistorySaveButton", "masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
@@ -1575,6 +1597,7 @@ async function init() {
   }
   renderAll();
   state.initializing = false;
+  renderShippingBackupGate();
   if (state.historySaveError) showResult("ng", "内部履歴確認失敗・作業停止", state.historySaveError, []);
   else if (!state.masterInfo) showResult("idle", "待機中", "マスターを読み込んでください。", []);
   else if (!state.currentDepartment) showResult("idle", "部署指定待ち", "20桁のオリコンラベルを読み取るか、検索から部署を選択してください。", []);
