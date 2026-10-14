@@ -10,7 +10,7 @@ const BACKUP_PATH = "C:\\システム\\SPD出荷チェッカー\\読取履歴";
 const ADMIN_PASSWORD_KEY = "adminPasswordHash";
 const ADMIN_PASSWORD_ITERATIONS = 150000;
 const SKIP_COMMAND = "SPD-SKIP";
-const APP_VERSION = "20261014-2";
+const APP_VERSION = "20261014-3";
 const ALTERNATE_JAN_STORAGE_KEY = "spd-alternate-jans-v1";
 let ALTERNATE_JANS = restoreAlternateJans(globalThis.ALTERNATE_JAN_BY_PRODUCT_CODE
   || (typeof module !== "undefined" && module.exports ? require("./alternate-jans.js") : {}));
@@ -68,7 +68,6 @@ let pendingHistoryRestorePlan = null;
 let backupWriteQueue = Promise.resolve();
 const pendingHistoryBackupIds = new Set();
 let historyPersistenceQueue = Promise.resolve();
-let backupAdminAuthorized = false;
 let workerConfirmBusy = false;
 
 function normalizeHeader(value) { return String(value ?? "").replace(/^\uFEFF/, "").trim(); }
@@ -985,7 +984,7 @@ function renderMasterInfo() {
   elements.masterRowCount.textContent = `${info?.rowCount || 0}件`;
   elements.masterMaxDate.textContent = info ? formatDateForDisplay(keyToDateInput(info.maxDate)) : "―";
 }
-function renderScannerStatus() { elements.scannerBufferStatus.textContent = state.scannerBuffer ? `Bluetoothリーダー入力中（${state.scannerBuffer.length}文字）` : "Bluetoothリーダー入力待機中"; }
+function renderScannerStatus() { elements.scannerBufferStatus.textContent = state.scannerBuffer ? `Bluetoothリーダー入力中（${state.scannerBuffer.length}文字）` : "Bluetoothリーダー入力待機中"; renderShippingBackupGate(); }
 
 function getHistoryFiltersFromUi() { return { startDate: elements.historyStartDate.value, endDate: elements.historyEndDate.value, facility: elements.historyFacility.value, department: elements.historyDepartment.value, result: elements.historyResult.value, search: elements.historySearch.value }; }
 function filterHistory(records, filters = {}) {
@@ -1039,9 +1038,13 @@ function getShippingBackupBlockResult() {
   if (state.backupSetupBusy) return { ok: false, code: "BACKUP_SETTING", title: "バックアップ設定中", message: "設定操作が終わるまでお待ちください。" };
   return isShippingBackupReady() ? null : historyStorageBlockResult();
 }
-function isBackupPreparationSafe() {
-  return state.backupPreparation && !state.currentDepartment && !state.workerCode && !state.pendingSpdLabel
-    && state.mode === "container" && !state.scannerBuffer && !state.historySaving && !state.historySaveError;
+function isBackupPreparationSafe(ownOperations = 0) {
+  return !state.initializing && !state.backupSetupBusy && !state.pendingSpdLabel
+    && !["product", "employee"].includes(state.mode) && !state.scannerBuffer
+    && !state.historySaving && !state.historySaveError && !appUpdate.reloading
+    && appUpdate.pendingOperations <= ownOperations && !unreadPdfBusy && (!unreadPdfPreview || unreadPdfPreview.closed)
+    && !["workerCodeDialog", "departmentSearchDialog", "adminPasswordDialog", "historyRestoreDialog", "skipBarcodePreview"]
+      .some(id => elements[id] && !elements[id].hidden);
 }
 async function retryFailedHistorySave() {
   const record = state.failedHistoryRecord;
@@ -1090,13 +1093,13 @@ function renderShippingBackupGate() {
   const supported = isHistoryBackupSupported(), status = state.backupStatus, safe = isBackupPreparationSafe();
   let title = !supported ? "履歴はブラウザ内に保存" : status === "ready" && !pendingHistoryBackupIds.size ? "バックアップ正常" : `バックアップ保留：${pendingHistoryBackupIds.size}件`;
   let message = state.backupReason || "内部履歴を保存して作業を継続できます。";
-  if (safe && supported && status !== "ready") message += state.backupDirectoryHandle ? " 作業前にアクセスを許可できます。" : " 管理者に保存先登録を依頼してください。";
+  if (safe && supported && status !== "ready") message += state.backupDirectoryHandle ? " 待機中にアクセスを許可できます。" : " 待機中に保存先を登録できます。";
   elements.shippingBackupGateTitle.textContent = title; elements.shippingBackupGateMessage.textContent = message;
   elements.shippingBackupGate.className = `card shipping-backup-gate${safe ? "" : " is-compact"}${status === "ready" ? " is-ready" : !supported ? " is-unsupported" : ""}`;
   elements.shippingBackupSetupButton.hidden = !supported || !safe || state.backupDirectoryHandle?.name !== "読取履歴" || !["permission", "error"].includes(status);
   elements.shippingBackupSetupButton.disabled = !safe; elements.shippingBackupSetupButton.textContent = "アクセスを許可";
   if (elements.configureHistoryBackupButton) {
-    elements.configureHistoryBackupButton.textContent = "バックアップ先登録・再設定（管理者）";
+    elements.configureHistoryBackupButton.textContent = "バックアップ先登録・再設定";
     elements.configureHistoryBackupButton.disabled = !supported || !safe;
   }
   if (elements.retryHistorySaveButton) { elements.retryHistorySaveButton.hidden = !state.historySaveError; elements.retryHistorySaveButton.disabled = state.historySaving; }
@@ -1107,39 +1110,62 @@ async function restoreHistoryBackup() {
   try {
     state.backupDirectoryHandle = await getHistorySetting(BACKUP_DIRECTORY_KEY);
     if (!state.backupDirectoryHandle) { setBackupStatus("unset", "保存先未設定"); return; }
-    if (state.backupDirectoryHandle.name !== "読取履歴") { setBackupStatus("registration", "指定先の登録が必要です。作業準備中に管理者へ依頼してください。"); return; }
+    if (state.backupDirectoryHandle.name !== "読取履歴") { setBackupStatus("registration", "指定先の登録が必要です。安全な待機状態で登録してください。"); return; }
     const permission = await state.backupDirectoryHandle.queryPermission({ mode: "readwrite" });
     setBackupStatus(permission === "granted" ? "ready" : "permission", permission === "granted" ? `設定済み（${state.backupDirectoryHandle.name}）` : "再度アクセス許可が必要です");
   } catch (error) { console.error("履歴バックアップ設定を読み込めません。", error); state.backupDirectoryHandle = null; setBackupStatus("error", "保存先設定を読み込めません"); }
 }
+function describeBackupFailure(stage, error) {
+  if (stage === "settings") return "設定情報を保存できませんでした。";
+  if (error?.name === "NotAllowedError" || stage === "permission") return "フォルダへの書込み権限がありません。アクセス許可を確認してください。";
+  if (stage === "folder") return error.message;
+  if (stage === "picker") return "フォルダを選択できませんでした。";
+  return "フォルダへの書込みに失敗しました。保存先フォルダを確認してください。";
+}
 async function configureHistoryBackup(windowRef = globalThis, { reuseExisting = false } = {}) {
   if (!isHistoryBackupSupported(windowRef)) { setBackupStatus("unsupported", "この端末ではローカル履歴バックアップ機能は利用できません"); return { ok: false, code: "UNSUPPORTED" }; }
-  // フォルダ選択で照合作業を中断させない。現在の1件が完了してから利用者操作で再設定する。
-  if (!isBackupPreparationSafe()) return { ok: false, code: "WORK_IN_PROGRESS", message: "ラベルマスタ取込後の作業準備中に設定してください。" };
-  if (!reuseExisting && !backupAdminAuthorized) return { ok: false, code: "ADMIN_REQUIRED" };
+  // ラッパー自身の1操作だけを除外し、保存・CSV書込み・入力・画面操作中は設定しない。
+  if (!isBackupPreparationSafe(1)) return { ok: false, code: "WORK_IN_PROGRESS", message: "現在の照合作業・保存・入力を完了してから設定してください。" };
   state.backupSetupBusy = true;
+  let stage = "picker";
   try {
-    // 保存先設定・変更では必ず選び直し、再許可の場合だけ既存ハンドルを使う。
     let handle = reuseExisting ? state.backupDirectoryHandle : null;
-    if (reuseExisting && (!handle || handle.name !== "読取履歴")) return { ok: false, code: "ADMIN_REQUIRED" };
-    if (handle) {
-      const permission = await handle.requestPermission({ mode: "readwrite" });
-      if (permission !== "granted") { setBackupStatus("permission", "アクセス許可が必要です"); return { ok: false, code: "PERMISSION_REQUIRED" }; }
+    if (reuseExisting && (!handle || handle.name !== "読取履歴")) {
+      const message = "保存済みフォルダを利用できません。バックアップ先を登録してください。";
+      setBackupStatus("registration", message); return { ok: false, code: "NOT_CONFIGURED", message };
     }
-    if (!handle) { backupAdminAuthorized = false; handle = await windowRef.showDirectoryPicker({ mode: "readwrite", id: "spd-history-backup" }); }
-    if (!reuseExisting && handle.name !== "読取履歴") throw new Error(`指定先 ${BACKUP_PATH} の「読取履歴」フォルダを選択してください。`);
+    if (!handle) handle = await windowRef.showDirectoryPicker({ mode: "readwrite", id: "spd-history-backup" });
+    stage = "folder";
+    if (handle.name !== "読取履歴") throw new Error(`指定先 ${BACKUP_PATH} の「読取履歴」フォルダを選択してください。`);
+    stage = "permission";
     let permission = await handle.queryPermission({ mode: "readwrite" });
     if (permission !== "granted") permission = await handle.requestPermission({ mode: "readwrite" });
-    if (permission !== "granted") throw new Error("選択したフォルダへの書込み権限を確認できません。");
-    await setHistorySetting(BACKUP_DIRECTORY_KEY, handle); state.backupDirectoryHandle = handle;
-    const retried = await flushPendingHistoryBackups(handle);
-    setBackupStatus("ready", `設定済み（${handle.name}）${retried ? `・保留${retried}件を保存` : ""}`);
-    return { ok: true, handle, retried };
+    if (permission !== "granted") throw Object.assign(new Error("書込み権限が許可されませんでした。"), { name: "NotAllowedError" });
+    stage = "settings";
+    await setHistorySetting(BACKUP_DIRECTORY_KEY, handle);
+    state.backupDirectoryHandle = handle;
+    // 設定はここで確定済み。CSV再保存の失敗で設定失敗へ読み替えない。
+    const before = pendingHistoryBackupIds.size;
+    try {
+      const retried = await flushPendingHistoryBackups(handle);
+      const message = `保存先を登録しました。保留${retried}件を保存しました。`;
+      setBackupStatus("ready", message);
+      return { ok: true, backupOk: true, code: "REGISTERED", handle, retried, message };
+    } catch (error) {
+      const detail = error.message || String(error);
+      const message = `保存先は登録されましたが、バックアップ保留履歴の保存に失敗しました。理由：${detail}`;
+      console.error("バックアップ設定成功・保留CSV再保存失敗", { stage: error.backupStage || "pending-csv", name: error.name, message: detail }, error);
+      setBackupStatus("error", message);
+      return { ok: true, backupOk: false, code: "REGISTERED_BACKUP_PENDING", handle, retried: before - pendingHistoryBackupIds.size, message, error };
+    }
   } catch (error) {
-    if (error?.name === "AbortError") return { ok: false, code: "CANCELLED" };
-    console.error("履歴バックアップ先を設定できません。", error); setBackupStatus("error", "保存先設定に失敗しました"); return { ok: false, code: "SETUP_FAILED", error };
+    if (stage === "picker" && error?.name === "AbortError") return { ok: false, code: "CANCELLED", message: "フォルダ選択をキャンセルしました。現在の設定を維持します。" };
+    const message = describeBackupFailure(stage, error);
+    console.error("履歴バックアップ先の登録失敗", { stage, name: error.name, message: error.message }, error);
+    setBackupStatus(stage === "permission" ? "permission" : "error", message);
+    return { ok: false, code: stage === "settings" ? "SETTINGS_SAVE_FAILED" : stage === "permission" ? "PERMISSION_REQUIRED" : "SETUP_FAILED", stage, message, error };
   } finally {
-    backupAdminAuthorized = false; state.backupSetupBusy = false; renderShippingBackupGate();
+    state.backupSetupBusy = false; renderShippingBackupGate();
     if (elements.modeStatus) { renderMode(); renderPendingPanel(); renderWorker(); }
   }
 }
@@ -1147,21 +1173,28 @@ async function writeHistoryBackupRecord(record, handle = state.backupDirectoryHa
   if (!isHistoryBackupSupported()) return { ok: false, code: "UNSUPPORTED" };
   if (!handle) return { ok: false, code: "NOT_CONFIGURED" };
   if (handle.name && handle.name !== "読取履歴") return { ok: false, code: "WRONG_DIRECTORY" };
+  let stage = "csv-permission";
+  try {
   const permission = await handle.queryPermission({ mode: "readwrite" });
   if (permission !== "granted") return { ok: false, code: "PERMISSION_REQUIRED" };
+  stage = "csv-open";
   const fileHandle = await handle.getFileHandle(historyBackupFileName(record), { create: true });
+  stage = "csv-read";
   const existingFile = await fileHandle.getFile();
   const existingText = existingFile.size ? await existingFile.text() : "";
   const existingHeader = existingText.replace(/^\uFEFF/, "").split(/\r?\n/, 1)[0];
+  stage = "csv-format";
   const columns = !existingFile.size || existingHeader === historyBackupHeader() ? HISTORY_BACKUP_COLUMNS : existingHeader === historyBackupHeader(LEGACY_HISTORY_BACKUP_COLUMNS) ? LEGACY_HISTORY_BACKUP_COLUMNS : null;
   if (!columns) throw new Error(`${fileHandle.name}の列構成が現在のバックアップ形式と一致しません。`);
   if (backupTextContainsHistoryId(existingText, record.historyId)) return { ok: true, code: "DUPLICATE_SKIPPED" };
   const separator = existingFile.size && !/\r?\n$/.test(existingText) ? "\r\n" : "";
   const content = existingFile.size ? `${separator}${historyBackupRow(record, columns)}\r\n` : `\uFEFF${historyBackupHeader(columns)}\r\n${historyBackupRow(record, columns)}\r\n`;
+  stage = "csv-write";
   const writable = await fileHandle.createWritable({ keepExistingData: true });
-  try { await writable.seek(existingFile.size); await writable.write(content); await writable.close(); }
+  try { await writable.seek(existingFile.size); await writable.write(content); stage = "csv-close"; await writable.close(); }
   catch (error) { try { await writable.abort?.(); } catch {} throw error; }
   return { ok: true, code: "SAVED", fileName: fileHandle.name };
+  } catch (error) { error.backupStage ||= stage; throw error; }
 }
 async function flushPendingHistoryBackups(handle = state.backupDirectoryHandle) {
   const flushing = backupWriteQueue.then(async () => {
@@ -1169,10 +1202,12 @@ async function flushPendingHistoryBackups(handle = state.backupDirectoryHandle) 
     let savedCount = 0;
     for (const historyId of [...pendingHistoryBackupIds]) {
       const record = recordsById.get(historyId);
-      if (!record) throw new Error("保留履歴に対応する内部履歴が見つかりません。管理者へ連絡してください。");
+      if (!record) throw Object.assign(new Error("保留履歴に対応する内部履歴が見つかりません。管理者へ連絡してください。"), { backupStage: "pending-history-lookup" });
       const result = await writeHistoryBackupRecord(record, handle);
-      if (!result.ok) throw new Error(result.code === "PERMISSION_REQUIRED" ? "保留履歴の保存にアクセス許可が必要です。" : "保留履歴をバックアップできません。");
-      await acknowledgeHistoryBackup(historyId); savedCount += 1;
+      if (!result.ok) throw Object.assign(new Error(result.code === "PERMISSION_REQUIRED" ? "保留履歴の保存にアクセス許可が必要です。" : "保留履歴をバックアップできません。"), { backupStage: "pending-csv", code: result.code });
+      try { await acknowledgeHistoryBackup(historyId); }
+      catch (error) { error.backupStage = "pending-idb-acknowledge"; throw error; }
+      savedCount += 1;
     }
     return savedCount;
   });
@@ -1198,7 +1233,7 @@ function enqueueHistoryBackup(record) {
     else if (result.code === "NOT_CONFIGURED") setBackupStatus("unset", "保存先未設定（ブラウザ内には保存済み）");
     else if (result.code === "WRONG_DIRECTORY") setBackupStatus("registration", "指定先の登録が必要です（ブラウザ内には保存済み）");
     else if (result.code === "PERMISSION_REQUIRED") setBackupStatus("permission", "アクセス許可が必要です（ブラウザ内には保存済み）");
-  }).catch((error) => { console.error("履歴バックアップに失敗しました。", error); setBackupStatus("error", "書き込みに失敗しました（ブラウザ内には保存済み）"); });
+  }).catch((error) => { console.error("履歴バックアップに失敗しました。", { stage: error.backupStage, name: error.name, message: error.message }, error); setBackupStatus("error", "フォルダへの書込みに失敗しました。保存先フォルダを確認してください。（ブラウザ内には保存済み）"); });
   return backupWriteQueue;
 }
 
@@ -1419,26 +1454,13 @@ function selectDepartmentFromSearch(department) {
 }
 
 async function handleConfigureHistoryBackup() {
-  if (!isBackupPreparationSafe()) {
-    const result = { ok: false, code: "WORK_IN_PROGRESS", message: "現在の照合作業を完了してからバックアップ先を設定してください。" };
-    elements.historyMessage.textContent = result.message;
-    renderShippingBackupGate();
-    return result;
-  }
-  return openAdminPasswordDialog("backup");
+  const result = await configureHistoryBackup();
+  elements.historyMessage.textContent = result.message || "現在の照合作業・保存・入力を完了してから設定してください。";
+  return result;
 }
 async function handleReauthorizeHistoryBackup() {
   const result = await configureHistoryBackup(globalThis, { reuseExisting: true });
-  if (result.ok) {
-    elements.historyMessage.textContent = `バックアップ先へのアクセスを確認しました。保留${result.retried}件を保存しました。`;
-  }
-  return result;
-}
-async function handleAdminBackupSelection() {
-  if (!backupAdminAuthorized || !isBackupPreparationSafe()) return { ok: false, code: "ADMIN_REQUIRED" };
-  const result = await configureHistoryBackup();
-  if (result.ok) { closeAdminPasswordDialog(); elements.historyMessage.textContent = "バックアップ先を登録しました。"; }
-  else elements.adminPasswordError.textContent = result.error?.message || "登録を完了できませんでした。再度管理者認証してください。";
+  elements.historyMessage.textContent = result.message || "現在の照合作業・保存・入力を完了してから再許可してください。";
   return result;
 }
 function openHistoryRestoreDialog() {
@@ -1481,14 +1503,11 @@ async function confirmHistoryRestore() {
 }
 
 async function openAdminPasswordDialog(action = "delete") {
-  if (action === "backup" && !isBackupPreparationSafe()) return false;
-  backupAdminAuthorized = false;
   try {
     const credential = await getHistorySetting(ADMIN_PASSWORD_KEY);
     adminPasswordReturnFocus = document.activeElement; elements.adminPasswordDialog.dataset.mode = credential ? "verify" : "setup"; elements.adminPasswordDialog.dataset.action = action;
     elements.adminPasswordHeading.textContent = credential ? "管理者認証" : "管理者パスワード初期設定";
-    elements.adminPasswordHelp.textContent = action === "backup" ? `バックアップ先：${BACKUP_PATH}。管理者認証後にフォルダを選択してください。完全なパスは選択画面で確認してください。` : credential ? action === "restore" ? "バックアップCSVから履歴を復元するには管理者パスワードを入力してください。" : "ブラウザ内の履歴を削除するには管理者パスワードを入力してください。バックアップCSVは削除されません。" : "初回のみ、履歴管理用の管理者パスワードを8文字以上で設定してください。パスワード自体は保存しません。";
-    elements.chooseBackupFolderButton.hidden = true; elements.confirmAdminPasswordButton.hidden = false;
+    elements.adminPasswordHelp.textContent = credential ? action === "restore" ? "バックアップCSVから履歴を復元するには管理者パスワードを入力してください。" : "ブラウザ内の履歴を削除するには管理者パスワードを入力してください。バックアップCSVは削除されません。" : "初回のみ、履歴管理用の管理者パスワードを8文字以上で設定してください。パスワード自体は保存しません。";
     elements.adminPasswordConfirmArea.hidden = Boolean(credential); elements.adminPasswordInput.value = ""; elements.adminPasswordConfirmInput.value = ""; elements.adminPasswordError.textContent = "";
     elements.adminPasswordDialog.hidden = false; document.body.classList.add("admin-password-dialog-open"); requestAnimationFrame(() => elements.adminPasswordInput.focus());
     return true;
@@ -1498,7 +1517,7 @@ async function openAdminPasswordDialog(action = "delete") {
     return false;
   }
 }
-function closeAdminPasswordDialog() { backupAdminAuthorized = false; elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
+function closeAdminPasswordDialog() { elements.adminPasswordDialog.hidden = true; document.body.classList.remove("admin-password-dialog-open"); if (adminPasswordReturnFocus?.focus) adminPasswordReturnFocus.focus(); adminPasswordReturnFocus = null; }
 async function confirmAdminPassword() {
   const password = elements.adminPasswordInput.value, mode = elements.adminPasswordDialog.dataset.mode, action = elements.adminPasswordDialog.dataset.action || "delete";
   try {
@@ -1506,12 +1525,6 @@ async function confirmAdminPassword() {
       if (password !== elements.adminPasswordConfirmInput.value) throw new Error("確認用パスワードが一致しません。");
       await setHistorySetting(ADMIN_PASSWORD_KEY, await createAdminPasswordCredential(password));
     } else if (!await verifyAdminPassword(password, await getHistorySetting(ADMIN_PASSWORD_KEY))) throw new Error("管理者パスワードが正しくありません。");
-    if (action === "backup") {
-      if (!isBackupPreparationSafe()) throw new Error("作業開始後は保存先を設定できません。");
-      backupAdminAuthorized = true; elements.adminPasswordInput.value = ""; elements.adminPasswordConfirmInput.value = "";
-      elements.chooseBackupFolderButton.hidden = false; elements.confirmAdminPasswordButton.hidden = true;
-      elements.chooseBackupFolderButton.focus(); return true;
-    }
     closeAdminPasswordDialog();
     if (action === "restore") { openHistoryRestoreDialog(); return true; }
     if (!confirm("ブラウザ内の読取履歴をすべて削除します。ローカルのバックアップCSVは削除されません。実行しますか？")) return false;
@@ -1519,7 +1532,7 @@ async function confirmAdminPassword() {
   } catch (error) { elements.adminPasswordError.textContent = error.message || "管理者認証に失敗しました。"; elements.adminPasswordInput.focus(); return false; }
 }
 function cacheElements() {
-  ["retryHistorySaveButton", "chooseBackupFolderButton", "masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
+  ["retryHistorySaveButton", "masterStatusBadge", "shippingBackupGate", "shippingBackupGateTitle", "shippingBackupGateMessage", "shippingBackupSetupButton", "targetStartDate", "targetEndDate", "periodError", "modeStatus", "clearDepartmentButton", "searchDepartmentButton", "currentFacility", "currentDepartment", "currentDepartmentCode", "resultPanel", "resultTitle", "resultMessage", "resultDetails", "pendingProductPanel", "pendingProductNumber", "pendingProductName", "pendingInstruction", "skipButton", "cancelPendingButton", "processingBreakdown", "targetCount", "readCount", "unreadCount", "currentWorkerCode", "changeWorkerButton", "workerCodeDialog", "workerCodeHeading", "workerCodeInput", "workerCodeError", "confirmWorkerButton", "cancelWorkerButton", "departmentSearchDialog", "departmentSearchInput", "departmentSearchCount", "departmentSearchList", "closeDepartmentSearchButton", "adminPasswordDialog", "adminPasswordHeading", "adminPasswordHelp", "adminPasswordInput", "adminPasswordConfirmArea", "adminPasswordConfirmInput", "adminPasswordError", "confirmAdminPasswordButton", "cancelAdminPasswordButton", "historyRestoreDialog", "chooseHistoryRestoreFilesButton", "historyRestoreFiles", "historyRestoreSummary", "historyRestoreError", "confirmHistoryRestoreButton", "cancelHistoryRestoreButton", "scannerBufferStatus", "unreadPeriodLabel", "unreadDepartmentLabel", "unreadTargetCount", "unreadReadCount", "unreadRemainingCount", "unreadList", "printUnreadButton", "shareUnreadPdfButton", "saveUnreadPdfButton", "unreadPrintMessage", "historyStartDate", "historyEndDate", "historyFacility", "historyDepartment", "historyResult", "historySearch", "historyCount", "historyList", "shareHistoryButton", "configureHistoryBackupButton", "historyBackupStatus", "restoreHistoryButton", "clearHistoryButton", "historyMessage", "masterFile", "importMessage", "masterLoaded", "masterFileName", "masterFacilityName", "masterImportedAt", "masterRowCount", "masterMaxDate", "enableAudioButton", "audioStatus", "showSkipBarcodeButton", "skipBarcodePreview", "skipBarcodeSvg", "printSkipBarcodeButton", "closeSkipBarcodeButton"].forEach((id) => { elements[id] = document.getElementById(id); });
 }
 function bindEvents() {
   document.querySelectorAll(".tab-button").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
@@ -1537,7 +1550,7 @@ function bindEvents() {
   elements.departmentSearchInput.addEventListener("input", renderDepartmentSearchList); elements.closeDepartmentSearchButton.addEventListener("click", closeDepartmentSearchDialog);
   [elements.historyStartDate, elements.historyEndDate, elements.historyFacility, elements.historyDepartment, elements.historyResult].forEach((input) => input.addEventListener("change", renderHistory)); elements.historySearch.addEventListener("input", renderHistory);
   elements.shareHistoryButton.addEventListener("click", async () => { try { const method = await shareHistoryCsv(); elements.historyMessage.textContent = method === "shared" ? "共有画面を開きました。メールアプリを選択できます。" : "共有非対応のためCSVをダウンロードしました。"; } catch (error) { if (error.name !== "AbortError") elements.historyMessage.textContent = error.message; } });
-  elements.configureHistoryBackupButton.addEventListener("click", handleConfigureHistoryBackup); elements.shippingBackupSetupButton.addEventListener("click", handleReauthorizeHistoryBackup); elements.chooseBackupFolderButton.addEventListener("click", handleAdminBackupSelection); elements.retryHistorySaveButton.addEventListener("click", retryFailedHistorySave);
+  elements.configureHistoryBackupButton.addEventListener("click", handleConfigureHistoryBackup); elements.shippingBackupSetupButton.addEventListener("click", handleReauthorizeHistoryBackup); elements.retryHistorySaveButton.addEventListener("click", retryFailedHistorySave);
   elements.restoreHistoryButton.addEventListener("click", () => openAdminPasswordDialog("restore")); elements.clearHistoryButton.addEventListener("click", () => openAdminPasswordDialog("delete")); elements.confirmAdminPasswordButton.addEventListener("click", confirmAdminPassword); elements.cancelAdminPasswordButton.addEventListener("click", closeAdminPasswordDialog); elements.adminPasswordInput.addEventListener("keydown", (event) => { if (event.key === "Enter" && elements.adminPasswordConfirmArea.hidden) { event.preventDefault(); void confirmAdminPassword(); } }); elements.adminPasswordConfirmInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void confirmAdminPassword(); } });
   elements.chooseHistoryRestoreFilesButton.addEventListener("click", () => { elements.historyRestoreFiles.value = ""; pendingHistoryRestorePlan = null; elements.confirmHistoryRestoreButton.disabled = true; elements.historyRestoreFiles.click(); }); elements.historyRestoreFiles.addEventListener("change", analyzeSelectedHistoryBackups); elements.confirmHistoryRestoreButton.addEventListener("click", confirmHistoryRestore); elements.cancelHistoryRestoreButton.addEventListener("click", closeHistoryRestoreDialog);
   elements.printUnreadButton.addEventListener("click", () => { void printUnreadList(); });
@@ -1661,8 +1674,9 @@ async function handleAppUpdateClick() {
 function trackUpdateOperation(operation) {
   return async function (...args) {
     appUpdate.pendingOperations += 1;
+    renderShippingBackupGate();
     try { return await operation.apply(this, args); }
-    finally { appUpdate.pendingOperations -= 1; }
+    finally { appUpdate.pendingOperations -= 1; renderShippingBackupGate(); }
   };
 }
 // 非同期処理開始から完了までを数え、照合完了直後の未保存時間帯も更新を止める。
