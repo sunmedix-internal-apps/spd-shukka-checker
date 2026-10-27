@@ -59,6 +59,14 @@ const ALTERNATE_JAN_BY_PRODUCT_CODE = {
     alternateJans: [
       "0192253015331"
     ]
+  },
+  "145104": {
+    productNo: "SCM-400PRP",
+    name: "サニーコップ",
+    spec: "検査用コップ　４００ｃｃ　５０入/袋",
+    alternateJans: [
+      "4974625517884"
+    ]
   }
 };
 
