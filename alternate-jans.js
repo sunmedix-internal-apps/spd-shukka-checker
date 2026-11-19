@@ -179,7 +179,31 @@ const ALTERNATE_JAN_BY_PRODUCT_CODE = {
     alternateJans: [
       "1498769653514"
     ]
-  }
+  },
+ "549812": {
+    productNo: "417014244",
+    name: "Ｆ　ＪＥＬＬＹ　ＰＬＵＳ",
+    spec: "ミドル　詰替用　空ボトル２本付　２ｋｇ",
+    alternateJans: [
+      "4547410357912"
+    ]
+  },
+  "69624": {
+    productNo: "60615",
+    name: "バードポート－Ｔｉ",
+    spec: "８．０Ｆｒ　Ｉ／Ｄ　１．５ｍｍ",
+    alternateJans: [
+      "0801741098253"
+    ]
+  }, 
+  "147587": {
+    productNo: "55417",
+    name: "セーフティセット　顔あて",
+    spec: "６００７",
+    alternateJans: [
+      "4580193600066"
+    ]
+  } 
 };
 
 // ブラウザ・Service Worker・自動テストで同じ表を使用する。
